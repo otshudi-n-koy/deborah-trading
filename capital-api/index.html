@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stratégie A — Courbe d'équité</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #080a0f; color: #e0e0e0; font-family: 'Courier New', monospace; padding: 24px; }
+    h1 { font-size: 14px; letter-spacing: 4px; color: #333; text-transform: uppercase; margin-bottom: 24px; }
+    .hero { margin-bottom: 32px; }
+    .capital { font-size: 48px; font-weight: 700; color: #fff; }
+    .pnl { font-size: 18px; margin-top: 8px; }
+    .positive { color: #00ff9d; }
+    .negative { color: #ff4466; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }
+    .stat { background: rgba(255,255,255,0.02); border: 1px solid #1a1f2e; border-radius: 8px; padding: 14px 16px; }
+    .stat-label { font-size: 10px; color: #444; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 6px; }
+    .stat-value { font-size: 20px; font-weight: 700; }
+    .chart-container { background: rgba(255,255,255,0.015); border: 1px solid #1a1f2e; border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+    .chart-title { font-size: 11px; letter-spacing: 3px; color: #444; text-transform: uppercase; margin-bottom: 16px; }
+    .updated { font-size: 10px; color: #333; margin-top: 16px; text-align: right; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #00ff9d; box-shadow: 0 0 12px #00ff9d; display: inline-block; margin-right: 8px; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  </style>
+</head>
+<body>
+  <h1><span class="dot"></span>Stratégie A · EMA 5min · BTC/USDT</h1>
+
+  <div class="hero">
+    <div class="capital" id="capital">—</div>
+    <div class="pnl" id="pnl">—</div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-label">Trades</div><div class="stat-value" id="total">—</div></div>
+    <div class="stat"><div class="stat-label">Win Rate</div><div class="stat-value" id="winrate">—</div></div>
+    <div class="stat"><div class="stat-label">Meilleur</div><div class="stat-value positive" id="best">—</div></div>
+    <div class="stat"><div class="stat-label">Pire</div><div class="stat-value negative" id="worst">—</div></div>
+  </div>
+
+  <div class="chart-container">
+    <div class="chart-title">Courbe d'équité</div>
+    <canvas id="chart" height="100"></canvas>
+  </div>
+
+  <div class="updated" id="updated">—</div>
+
+  <script>
+    const INITIAL = 25.00;
+    let chart = null;
+
+    async function load() {
+      try {
+        const res = await fetch('/api/capital');
+        const data = await res.json();
+        const trades = data.trades;
+        const capital = data.capital_current;
+
+        // Hero
+        document.getElementById('capital').textContent = '$' + capital.toFixed(2);
+        const pnl = capital - INITIAL;
+        const pnlPct = (pnl / INITIAL) * 100;
+        const pnlEl = document.getElementById('pnl');
+        pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' USD (' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%)';
+        pnlEl.className = 'pnl ' + (pnl >= 0 ? 'positive' : 'negative');
+
+        // Stats
+        const wins = trades.filter(t => t.pnl_usd > 0).length;
+        const nonZero = trades.filter(t => t.pnl_usd != 0).length;
+        document.getElementById('total').textContent = trades.length;
+        document.getElementById('winrate').textContent = nonZero > 0 ? Math.round(wins/nonZero*100) + '%' : '—';
+        document.getElementById('best').textContent = '+$' + Math.max(...trades.map(t => parseFloat(t.pnl_usd))).toFixed(2);
+        document.getElementById('worst').textContent = '$' + Math.min(...trades.map(t => parseFloat(t.pnl_usd))).toFixed(2);
+
+        // Chart
+        const labels = [0, ...trades.map(t => t.trade_no)];
+        const values = [INITIAL, ...trades.map(t => parseFloat(t.capital_after))];
+        const colors = trades.map(t => parseFloat(t.pnl_usd) >= 0 ? '#00ff9d' : '#ff4466');
+
+        if (chart) {
+          chart.data.labels = labels;
+          chart.data.datasets[0].data = values;
+          chart.update();
+        } else {
+          const ctx = document.getElementById('chart').getContext('2d');
+          chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels,
+              datasets: [{
+                data: values,
+                borderColor: '#00ff9d',
+                borderWidth: 2,
+                backgroundColor: 'rgba(0,255,157,0.05)',
+                fill: true,
+                tension: 0.3,
+                pointBackgroundColor: ['#fff', ...colors],
+                pointRadius: 3,
+              }]
+            },
+            options: {
+              responsive: true,
+              plugins: { legend: { display: false } },
+              scales: {
+                x: { ticks: { color: '#444', font: { family: 'monospace', size: 10 } }, grid: { color: '#1a1f2e' } },
+                y: { ticks: { color: '#444', font: { family: 'monospace', size: 10 }, callback: v => '$' + v.toFixed(0) }, grid: { color: '#1a1f2e' } }
+              }
+            }
+          });
+        }
+
+        document.getElementById('updated').textContent = 'Mis à jour : ' + new Date().toLocaleTimeString('fr-FR');
+      } catch(e) {
+        console.error(e);
+      }
+    }
+
+    load();
+    setInterval(load, 30000); // refresh toutes les 30s
+  </script>
+</body>
+</html>

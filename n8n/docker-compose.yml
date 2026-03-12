@@ -1,0 +1,20 @@
+services:
+  n8n:
+    image: n8nio/n8n
+    restart: always
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - GENERIC_TIMEZONE=Europe/Paris
+      - TZ=Europe/Paris
+      - N8N_SECURE_COOKIE=false
+      - WEBHOOK_URL=http://5.75.150.1:5678/
+      - NODE_FUNCTION_ALLOW_BUILTIN=crypto,https
+      - NODE_FUNCTION_ALLOW_EXTERNAL=crypto
+    volumes:
+      - n8n_data:/home/node/.n8n
+volumes:
+  n8n_data:
