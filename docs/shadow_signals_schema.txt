@@ -1,0 +1,29 @@
+                                           Table "public.shadow_signals"
+     Column      |            Type             | Collation | Nullable |                  Default                   
+-----------------+-----------------------------+-----------+----------+--------------------------------------------
+ id              | integer                     |           | not null | nextval('shadow_signals_id_seq'::regclass)
+ created_at      | timestamp without time zone |           |          | now()
+ symbol          | text                        |           | not null | 
+ prix_actuel     | numeric(12,2)               |           |          | 
+ ema9_5m         | numeric(12,2)               |           |          | 
+ ema9_1h         | numeric(12,2)               |           |          | 
+ ema26_1h        | numeric(12,2)               |           |          | 
+ rsi_14          | numeric(8,4)                |           |          | 
+ atr_percent     | numeric(8,4)                |           |          | 
+ trend_1h        | text                        |           |          | 
+ signal_detected | boolean                     |           |          | false
+ direction       | text                        |           |          | 
+ blocked_reason  | text                        |           |          | 
+ tp_pct          | numeric(8,4)                |           |          | 
+ sl_pct          | numeric(8,4)                |           |          | 
+ entry_price     | numeric(12,2)               |           |          | 
+ tp_price        | numeric(12,2)               |           |          | 
+ sl_price        | numeric(12,2)               |           |          | 
+ mfe_pct         | numeric(8,4)                |           |          | 
+ mae_pct         | numeric(8,4)                |           |          | 
+ sim_outcome     | text                        |           |          | 
+Indexes:
+    "shadow_signals_pkey" PRIMARY KEY, btree (id)
+    "idx_shadow_signals_created" btree (created_at DESC)
+    "idx_shadow_signals_symbol" btree (symbol)
+
