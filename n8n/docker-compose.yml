@@ -1,6 +1,6 @@
 services:
   n8n:
-    image: n8nio/n8n
+    image: n8nio/n8n:2.12.3
     restart: always
     ports:
       - "5678:5678"
@@ -16,5 +16,21 @@ services:
       - NODE_FUNCTION_ALLOW_EXTERNAL=crypto
     volumes:
       - n8n_data:/home/node/.n8n
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: always
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SERVER_ROOT_URL=https://deborah-trading.duckdns.org/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_SERVER_DOMAIN=deborah-trading.duckdns.org
+      - GF_SERVER_PROTOCOL=http
+      - GF_SECURITY_ADMIN_PASSWORD=Trading2026
+      - GF_SECURITY_COOKIE_SECURE=false
+      - GF_SECURITY_COOKIE_SAMESITE=lax
+    volumes:
+      - grafana_data:/var/lib/grafana
 volumes:
   n8n_data:
+  grafana_data:
