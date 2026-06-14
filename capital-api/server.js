@@ -4,7 +4,7 @@ const path = require('path');
 
 const app = express();
 const pool = new Pool({
-  host: 'localhost',
+  host: '127.0.0.1',
   port: 5432,
   database: 'trading',
   user: 'trading',

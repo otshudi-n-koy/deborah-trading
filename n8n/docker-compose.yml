@@ -7,13 +7,18 @@ services:
     environment:
       - N8N_HOST=0.0.0.0
       - N8N_PORT=5678
-      - N8N_PROTOCOL=http
+      - N8N_PROTOCOL=https
       - GENERIC_TIMEZONE=Europe/Paris
       - TZ=Europe/Paris
       - N8N_SECURE_COOKIE=false
-      - WEBHOOK_URL=http://5.75.150.1:5678/
+      - WEBHOOK_URL=https://deborah-trading.duckdns.org/
       - NODE_FUNCTION_ALLOW_BUILTIN=crypto,https
       - NODE_FUNCTION_ALLOW_EXTERNAL=crypto
+      - NODE_OPTIONS=--max-old-space-size=512
+    deploy:
+      resources:
+        limits:
+          memory: 600M
     volumes:
       - n8n_data:/home/node/.n8n
   grafana:
