@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import requests
 from datetime import datetime, timezone
+import smc_choch_bos
 
 LOG_FILE = '/opt/deborah-trading/scripts/signal_generator.log'
 logging.basicConfig(
@@ -105,13 +106,13 @@ def run():
             return
 
         # 2. Vérifier bot status
-        cur.execute("SELECT bot_status, capital_actuel, risk_pct_current, daily_pnl_pct, consecutive_losses, session_bias FROM capital_smc WHERE id=1")
+        cur.execute("SELECT bot_status, capital_actuel, risk_pct_current, daily_pnl_pct, consecutive_losses FROM capital_smc WHERE id=1")
         cap = cur.fetchone()
         if not cap:
             logging.warning('Pas de données capital_smc')
             return
 
-        bot_status, capital_actuel, risk_pct, daily_pnl, consec_losses, session_bias = cap
+        bot_status, capital_actuel, risk_pct, daily_pnl, consec_losses = cap
         if bot_status != 'ACTIVE':
             logging.info(f'Bot en pause: {bot_status}')
             return
@@ -123,14 +124,21 @@ def run():
         if int(consec_losses or 0) >= 3:
             logging.info(f'Circuit breaker: {consec_losses} pertes consecutives — pause session')
             return
-        # Filtre biais session
-        bias_db = session_bias or "NEUTRE"
+        # Filtre biais session — DECOUPLAGE 04/08/2026 (ticket Kanboard refonte
+        # agent pre-killzone) : bascule de capital_smc.session_bias (ecrit de
+        # facon asynchrone par l'agent LLM, pouvait rester fige en cas de panne
+        # de l'agent) vers structure_smc.bias, calcule de facon deterministe et
+        # horaire par structure_analyzer.py. Le pipeline de production ne depend
+        # plus d'aucune sortie du LLM pour decider quoi trader.
+        cur.execute("SELECT bias FROM structure_smc ORDER BY updated_at DESC LIMIT 1")
+        struct_bias_row = cur.fetchone()
+        bias_db = (struct_bias_row[0] if struct_bias_row else None) or "NEUTRAL"
         if bias_db == "BEARISH":
             signal_type_allowed = "SELL_LIMIT"
         elif bias_db == "BULLISH":
             signal_type_allowed = "BUY_LIMIT"
         else:
-            signal_type_allowed = None  # NEUTRE = les deux autorises
+            signal_type_allowed = None  # NEUTRAL = les deux autorises
 
 
         # 4. Vérifier structure (confluence)
@@ -170,14 +178,27 @@ def run():
             return
         current_price = float(price_row[0])
 
-        # 7. Récupérer PD Arrays valides
+        # 6b. Filtre ATR minimum
+        ATR_MIN_PIPS = 3.0
+        cur.execute("SELECT AVG(high-low)*10000 FROM (SELECT high,low FROM prices_smc WHERE timeframe='M5' ORDER BY candle_time DESC LIMIT 14) t")
+        atr_row = cur.fetchone()
+        atr_pips = float(atr_row[0]) if atr_row and atr_row[0] else 0
+        if atr_pips < ATR_MIN_PIPS:
+            logging.info(f'ATR trop faible: {atr_pips:.1f}p')
+            return
+        # 7. Recuperer PD Arrays valides
         direction = 'bullish' if bias == 'BULLISH' else 'bearish'
+        # FILTRE URGENT 18/07/2026 : pd_array_detector.py detecte desormais
+        # aussi des zones H4/D1 (chantier weekend), mais signal_generator.py
+        # (MIN_SL=10p, buffer=3p, sizing) n'est calibre que pour M5. Restreint
+        # a M5 en attente d'une adaptation multi-timeframe du risque/sizing.
         cur.execute("""
             SELECT id, type, direction, price_high, price_low, price_eq, strength, combo
             FROM pd_arrays_smc
             WHERE status = 'active' AND touched = 0
             AND direction = %s
             AND price_high >= 0
+            AND timeframe = 'M5'
             ORDER BY strength DESC, created_at DESC
             LIMIT 10
         """, (direction,))
@@ -193,7 +214,11 @@ def run():
             return
 
         # 8. Trouver le meilleur PD Array où le prix est dedans
-        buffer = 0.00030
+        # Buffer porte de 3 a 5 pips le 03/08/2026, suite backtest de sensibilite
+        # (ticket Kanboard #39) : 3p -> Kelly -0.318 (403 trades baseline) / 5p ->
+        # Kelly -0.126 (495 trades) et sur filtre CHoCH+BOS, 3p -> n=6/Kelly+1.38
+        # / 5p -> n=9/Kelly+0.677. Meilleur compromis volume/qualite retenu.
+        buffer = 0.00050
         best_array = None
         for arr in pd_arrays:
             in_array = (
@@ -222,12 +247,27 @@ def run():
             if entry - sl < MIN_SL:
                 sl = round(entry - MIN_SL, 5)
             tp = float(swing_high) if float(liq_target) < float(current_price) + 0.0015 else float(liq_target)
+            # GARDE-FOU DIRECTIONNEL (24/07/2026) : swing_high peut etre obsolete
+            # (ancien plus haut deja depasse par le prix) si structure_smc n'a pas
+            # encore forme un nouveau swing suite a un mouvement recent. Dans ce
+            # cas swing_high se retrouve sous current_price - absurde comme TP
+            # d'un BUY. Bascule sur liq_target si detecte, meme si "trop proche".
+            if tp <= current_price:
+                tp = float(liq_target)
         else:
             entry = best_array['price_eq']
             sl    = round(best_array['price_high'] + sl_buffer, 5)
             if sl - entry < MIN_SL:
                 sl = round(entry + MIN_SL, 5)
-            tp = float(swing_high) if float(liq_target) < float(current_price) + 0.0015 else float(liq_target)
+            tp = float(swing_low) if float(liq_target) > float(current_price) - 0.0015 else float(liq_target)
+            # GARDE-FOU DIRECTIONNEL (24/07/2026) : meme logique, swing_low peut
+            # etre obsolete (ancien plus bas deja depasse par le prix) et se
+            # retrouver au-dessus de current_price - absurde comme TP d'un SELL.
+            # Bug decouvert sur ce cas precis : swing_low=1.13758 alors que le
+            # prix etait deja descendu a 1.13714, rejetant le signal en boucle
+            # via "TP invalide pour SELL" sans jamais se corriger.
+            if tp >= current_price:
+                tp = float(liq_target)
 
         # Validation TP
         if bias == 'BULLISH' and tp <= entry:
@@ -242,8 +282,15 @@ def run():
         reward = abs(tp - entry)
         rr     = round(reward / risk, 2)
 
-        if rr < 1.5:
-            logging.info(f'RR insuffisant: {rr} (min 1.5)')
+        # MIN_RR abaisse de 1.5 a 1.2 le 05/08/2026 (ticket Kanboard #43).
+        # Backtest de sensibilite (backtest_rr_sensitivity.py, confluence H1/H4
+        # obligatoire + buffer 5 pips + simulation reelle SL/TP) : SELL_LIMIT
+        # seul, MIN_RR=1.2 -> n=10/WR=80%/Kelly=+0.962 vs MIN_RR=1.5 (ancien)
+        # -> n=5/WR=60%/Kelly=+0.68. Pattern monotone sur 5 seuils testes
+        # (1.0/1.2/1.5/2.0/2.5), echantillon encore petit (n=10) a confirmer
+        # empiriquement sur trades reels post-patch.
+        if rr < 1.2:
+            logging.info(f'RR insuffisant: {rr} (min 1.2)')
             return
 
         # 12. Calculer lot size
@@ -252,13 +299,58 @@ def run():
         risk_eur    = capital * risk_pct_f
         sl_pips     = round(risk * 10000, 1)
         pip_value   = 10
-        lot_size    = round(risk_eur / (sl_pips * pip_value), 2)
+        lot_size    = round(min(risk_eur / (sl_pips * pip_value), 2.0), 2)
         tp_pips     = round(reward * 10000, 1)
 
         signal_type = 'BUY_LIMIT' if bias == 'BULLISH' else 'SELL_LIMIT'
         # Bloquer si biais contraire
         if signal_type_allowed and signal_type != signal_type_allowed:
             logging.info(f'Signal {signal_type} bloque — biais {bias_db} autorise seulement {signal_type_allowed}')
+            return
+        # PAUSE BUY (16/07/2026) : BUY structurellement negatif (-7.54EUR/8 trades)
+        # vs SELL positif (+22.80EUR/6 trades). Suspendu en attente d'un filtre
+        # valide (CHoCH+BOS+OB+FVG+discount+liquidity sweep) backteste et calibre.
+        # Retirer ce bloc une fois le filtre BUY valide et deploye.
+        if signal_type == 'BUY_LIMIT':
+            logging.info('Signal BUY_LIMIT bloque — BUY en pause (perf negative, filtre en cours de calibration)')
+            # Mode SHADOW : on logue quand meme le setup qu'on aurait pris,
+            # pour evaluer a posteriori sur 30-50 echantillons avant reactivation.
+            # Ajout 03/08/2026 : flag passed_choch_bos_filter, calcule via le
+            # module smc_choch_bos.py (meme logique validee en backtest,
+            # WR 66.7% / Kelly +1.38 sur echantillon n=6 - non concluant seul
+            # mais tres encourageant, accumulation de donnees en cours).
+            _choch_bos_passed = None
+            _choch_level = None
+            try:
+                cur.execute("""
+                    SELECT candle_time, open, high, low, close
+                    FROM prices_smc
+                    WHERE timeframe = 'M5'
+                    ORDER BY candle_time DESC
+                    LIMIT 90
+                """)
+                _m5_rows = cur.fetchall()
+                _m5_window = list(reversed([
+                    {'candle_time': r[0], 'open': float(r[1]), 'high': float(r[2]),
+                     'low': float(r[3]), 'close': float(r[4])} for r in _m5_rows
+                ]))
+                _choch_bos_passed, _choch_level = smc_choch_bos.passed_choch_bos_filter(_m5_window)
+            except Exception as _cbe:
+                logging.error(f'Erreur calcul filtre CHoCH/BOS shadow: {_cbe}')
+                _choch_bos_passed, _choch_level = None, None
+            try:
+                cur.execute("""
+                    INSERT INTO signals_shadow
+                        (type, entry_price, sl_price, tp_price, sl_pips, tp_pips,
+                         rr_ratio, lot_size_hypothetique, killzone,
+                         passed_choch_bos_filter, choch_level)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (signal_type, entry, sl, tp, sl_pips, tp_pips, rr, lot_size, killzone,
+                      _choch_bos_passed, _choch_level))
+                conn.commit()
+                logging.info(f'Setup BUY logue en shadow (entry={entry} sl={sl} tp={tp} rr={rr} choch_bos={_choch_bos_passed})')
+            except Exception as e:
+                logging.error(f'Erreur log signals_shadow: {e}')
             return
 
         # 13. Insérer le signal

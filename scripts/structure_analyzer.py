@@ -25,6 +25,9 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s'
 )
 
+BUFFER_NEUTRAL_PIPS = 0.0005  # 5 pips : zone tampon autour du point median
+                               # avant de trancher un biais BULLISH/BEARISH
+
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
 
@@ -80,7 +83,10 @@ def analyze_structure(candles, window_size=3):
         fL = min(float(c['low'])  for c in recent)
         rng = fH - fL
         eq50 = fL + rng * 0.5
-        bias = 'BEARISH' if current_close < eq50 else 'BULLISH'
+        if abs(current_close - eq50) < BUFFER_NEUTRAL_PIPS:
+            bias = 'NEUTRAL'
+        else:
+            bias = 'BEARISH' if current_close < eq50 else 'BULLISH'
         return {
             'bias': bias,
             'swing_high': fH, 'swing_low': fL,
@@ -101,9 +107,34 @@ def analyze_structure(candles, window_size=3):
     last_ll = swing_lows[-1]
     prev_ll = swing_lows[-2]
 
+    # GARDE-FOU REACTIVITE (28/07/2026) : un swing confirme (window_size=3)
+    # necessite 3 bougies APRES l'extreme pour etre reconnu, creant un delai
+    # structurel pendant lequel swing_low/swing_high reste obsolete si le
+    # prix a deja franchi ce niveau de facon decisive. Cause racine du bug
+    # TP corrige en urgence le 24/07/2026 (rustine cote signal_generator.py,
+    # celle-ci corrige la source). On complete last_hh/last_ll avec l'extreme
+    # le plus recent des dernieres bougies si celui-ci depasse le swing confirme,
+    # evitant que le calcul de biais/liquidite se base sur un niveau perime.
+    RECENT_LOOKBACK = 10
+    MIN_SIGNIFICANT_PIPS = 0.0010  # meme seuil que filter_sig, pour eviter qu'une
+                                    # simple meche non significative ne remplace un
+                                    # swing confirme comme reference structurelle
+    recent = candles[-RECENT_LOOKBACK:]
+    recent_low_val = min(float(c['low']) for c in recent)
+    recent_high_val = max(float(c['high']) for c in recent)
+    if recent_low_val < last_ll['price'] - MIN_SIGNIFICANT_PIPS:
+        idx_low = min(range(len(recent)), key=lambda i: float(recent[i]['low']))
+        last_ll = {'price': recent_low_val, 'time': recent[idx_low]['candle_time']}
+    if recent_high_val > last_hh['price'] + MIN_SIGNIFICANT_PIPS:
+        idx_high = max(range(len(recent)), key=lambda i: float(recent[i]['high']))
+        last_hh = {'price': recent_high_val, 'time': recent[idx_high]['candle_time']}
+
     # Biais basé sur position dans le range macro (ICT Premium/Discount)
     range_mid = (last_hh['price'] + last_ll['price']) / 2
-    bias = 'BULLISH' if current_close > range_mid else 'BEARISH'
+    if abs(current_close - range_mid) < BUFFER_NEUTRAL_PIPS:
+        bias = 'NEUTRAL'
+    else:
+        bias = 'BULLISH' if current_close > range_mid else 'BEARISH'
     bos_price = mss_price = None
 
     if   current_close > last_hh['price'] and last_hh['price'] > prev_hh['price']:
@@ -155,7 +186,7 @@ def run():
         cur.execute("""
             SELECT candle_time, open, high, low, close
             FROM prices_smc
-            WHERE timeframe = '1H'
+            WHERE timeframe = 'H1'
             AND candle_time >= NOW() - INTERVAL '20 days'
             ORDER BY candle_time ASC
             LIMIT 480
@@ -166,7 +197,7 @@ def run():
         cur.execute("""
             SELECT candle_time, open, high, low, close
             FROM prices_smc
-            WHERE timeframe = '4H'
+            WHERE timeframe = 'H4'
             AND candle_time >= NOW() - INTERVAL '60 days'
             ORDER BY candle_time ASC
             LIMIT 360
@@ -191,7 +222,10 @@ def run():
 
         if not confluence:
             logging.info(f'Pas de confluence — 1H: {s1h["bias"]} / 4H: {s4h["bias"]}')
-            return
+            # IMPORTANT : ne PAS return ici. Il faut ecrire confluence=false en DB
+            # pour que signal_generator.py voie l'etat reel a jour, sinon la table
+            # garde silencieusement la derniere confluence=true figee (bug decouvert
+            # le 06/07/2026 : signal #78 genere sur une confluence perimee de 3 jours).
 
         # Upsert dans structure_smc
         cur.execute("""
@@ -215,7 +249,7 @@ def run():
               liquidity_target = EXCLUDED.liquidity_target,
               updated_at       = NOW()
         """, (
-            s4h['bias'], s4h['bias'], confluence,
+            s1h['bias'], s4h['bias'], confluence,
             s1h['swing_high'], s1h['swing_low'],
             s1h['last_bos_price'], s1h['last_mss_price'],
             s1h['zone_type'],
@@ -225,7 +259,7 @@ def run():
 
         conn.commit()
         logging.info(
-            f"Structure OK — bias={s4h['bias']} h4={s4h['bias']} "
+            f"Structure OK — bias={s1h['bias']} h4={s4h['bias']} "
             f"confluence={confluence} zone={s1h['zone_type']} "
             f"eq50={s1h['eq50']} 1H={len(rows_1h)} 4H={len(rows_4h)}"
         )

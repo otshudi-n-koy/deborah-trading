@@ -25,8 +25,16 @@ DB_CONFIG = {
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
 
-def detect_ob(candles):
+def detect_ob(candles, fvgs=None):
     """Détecte les Order Blocks (dernière bougie opposée avant un move fort)"""
+    if fvgs is None:
+        fvgs = []
+    # Index des FVG par candle_time de la bougie de displacement (bougie du milieu
+    # du triplet dans detect_fvg), pour correler rapidement OB <-> FVG
+    fvg_by_time = {}
+    for f in fvgs:
+        fvg_by_time.setdefault(f['candle_time'], []).append(f['direction'])
+
     obs = []
     for i in range(2, len(candles) - 1):
         c     = candles[i]
@@ -52,6 +60,9 @@ def detect_ob(candles):
             n_close < n_open and          # suivie rouge
             n_body > c_body * 1.5 and     # body suivant > 1.5x
             n_close < c_open):            # close sous l'open de l'OB
+            # Confirmation displacement : un FVG bearish sur la bougie de
+            # displacement (next1, celle qui suit l'OB) valide le mouvement
+            fvg_confirmed = 'bearish' in fvg_by_time.get(next1['candle_time'], [])
             obs.append({
                 'type': 'OB',
                 'direction': 'bearish',
@@ -59,7 +70,8 @@ def detect_ob(candles):
                 'price_low':  c_open,
                 'price_eq':   round((c_high + c_open) / 2, 5),
                 'candle_time': c['candle_time'],
-                'strength': 2
+                'strength': 3 if fvg_confirmed else 2,
+                'fvg_confirmed': fvg_confirmed
             })
 
         # OB Bullish : bougie baissière suivie d'une bougie haussière forte
@@ -67,6 +79,7 @@ def detect_ob(candles):
               n_close > n_open and        # suivie verte
               n_body > c_body * 1.5 and   # body suivant > 1.5x
               n_close > c_open):          # close au-dessus de l'open de l'OB
+            fvg_confirmed = 'bullish' in fvg_by_time.get(next1['candle_time'], [])
             obs.append({
                 'type': 'OB',
                 'direction': 'bullish',
@@ -74,7 +87,8 @@ def detect_ob(candles):
                 'price_low':  c_low,
                 'price_eq':   round((c_open + c_low) / 2, 5),
                 'candle_time': c['candle_time'],
-                'strength': 2
+                'strength': 3 if fvg_confirmed else 2,
+                'fvg_confirmed': fvg_confirmed
             })
 
     return obs
@@ -124,35 +138,89 @@ def detect_fvg(candles):
 
     return fvgs
 
+# Timeframes traites : (label DB reel/vivant, fenetre de lookback, label a stocker
+# dans pd_arrays_smc.timeframe). ATTENTION : 'M5' (pas '5M'), 'H4' (pas '4H'),
+# 'D1' (pas '1D') sont les flux vivants - verifie le 18/07/2026 (piege deja
+# rencontre sur M5/5M le 13/07 et re-confirme ici pour H4/D1).
+TIMEFRAMES_HTF = [
+    {'db_label': 'M5', 'lookback': '12 hours', 'store_label': 'M5'},
+    {'db_label': 'H4', 'lookback': '60 days',  'store_label': 'H4'},
+    {'db_label': 'D1', 'lookback': '365 days', 'store_label': 'D1'},
+]
+
+def process_timeframe(cur, conn, tf_config, current_price):
+    """Detecte et insere les PD arrays pour un timeframe donne. Retourne (obs_count, fvgs_count, inserted)."""
+    cur.execute("""
+        SELECT candle_time, open, high, low, close
+        FROM prices_smc
+        WHERE timeframe = %s
+        AND candle_time >= NOW() - INTERVAL %s
+        ORDER BY candle_time ASC
+    """, (tf_config['db_label'], tf_config['lookback']))
+    rows = [{'candle_time': r[0], 'open': r[1], 'high': r[2],
+             'low': r[3], 'close': r[4]} for r in cur.fetchall()]
+
+    if len(rows) < 10:
+        logging.warning(f"[{tf_config['store_label']}] Pas assez de bougies: {len(rows)}")
+        return 0, 0, 0
+
+    fvgs = detect_fvg(rows)
+    obs  = detect_ob(rows, fvgs=fvgs)
+    arrays = obs + fvgs
+
+    inserted = 0
+    for arr in arrays:
+        cur.execute("""
+            SELECT COUNT(*) FROM pd_arrays_smc
+            WHERE type = %s AND direction = %s
+            AND ABS(price_eq - %s) < 0.00010
+            AND status = 'active'
+            AND timeframe = %s
+        """, (arr['type'], arr['direction'], arr['price_eq'], tf_config['store_label']))
+
+        if cur.fetchone()[0] > 0:
+            continue
+
+        # fvg_confirmed n'existe que pour les OB (defaut False pour les FVG eux-memes)
+        fvg_confirmed = arr.get('fvg_confirmed', False)
+
+        cur.execute("""
+            INSERT INTO pd_arrays_smc
+            (type, direction, price_high, price_low, price_eq,
+             strength, touched, status, combo, timeframe, candle_time, created_at,
+             fvg_confirmed)
+            VALUES (%s, %s, %s, %s, %s, %s, 0, 'active', false, %s, %s, NOW(), %s)
+        ON CONFLICT ON CONSTRAINT pd_arrays_unique DO NOTHING
+        """, (
+            arr['type'], arr['direction'],
+            arr['price_high'], arr['price_low'], arr['price_eq'],
+            arr['strength'], tf_config['store_label'], arr['candle_time'],
+            fvg_confirmed
+        ))
+        inserted += 1
+
+    conn.commit()
+    return len(obs), len(fvgs), inserted
+
+
 def run():
     try:
         conn = get_conn()
         cur  = conn.cursor()
 
-        # Récupérer bougies 5M des 12 dernières heures
+        # Prix actuel (M5, reference pour invalidation, commune a tous les timeframes)
         cur.execute("""
-            SELECT candle_time, open, high, low, close
-            FROM prices_smc
-            WHERE timeframe = 'M5'
-            AND candle_time >= NOW() - INTERVAL '12 hours'
-            ORDER BY candle_time ASC
+            SELECT close FROM prices_smc WHERE timeframe = 'M5'
+            ORDER BY candle_time DESC LIMIT 1
         """)
-        rows = [{'candle_time': r[0], 'open': r[1], 'high': r[2],
-                 'low': r[3], 'close': r[4]} for r in cur.fetchall()]
-
-        if len(rows) < 10:
-            logging.warning(f'Pas assez de bougies 5M: {len(rows)}')
+        price_row = cur.fetchone()
+        if not price_row:
+            logging.warning('Pas de prix M5 disponible')
             return
+        current_price = float(price_row[0])
 
-        # Détecter OB et FVG
-        obs  = detect_ob(rows)
-        fvgs = detect_fvg(rows)
-        arrays = obs + fvgs
-
-        # Prix actuel
-        current_price = float(rows[-1]['close'])
-
-        # Invalider les PD Arrays touchés par le prix
+        # Invalider les PD Arrays touches par le prix (tous timeframes confondus,
+        # un niveau reste un niveau quel que soit le TF sur lequel il a ete detecte)
         cur.execute("""
             UPDATE pd_arrays_smc
             SET status = 'invalidated', invalidated_at = NOW()
@@ -163,43 +231,21 @@ def run():
                 (direction = 'bullish' AND %s <= price_high AND %s >= price_low - 0.00020)
             )
         """, (current_price, current_price, current_price, current_price))
-
-        inserted = 0
-        for arr in arrays:
-            # Vérifier qu'il n'existe pas déjà un array similaire
-            cur.execute("""
-                SELECT COUNT(*) FROM pd_arrays_smc
-                WHERE type = %s AND direction = %s
-                AND ABS(price_eq - %s) < 0.00010
-                AND status = 'active'
-            """, (arr['type'], arr['direction'], arr['price_eq']))
-
-            if cur.fetchone()[0] > 0:
-                continue
-
-            cur.execute("""
-                INSERT INTO pd_arrays_smc
-                (type, direction, price_high, price_low, price_eq,
-                 strength, touched, status, combo, timeframe, candle_time, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, 0, 'active', false, '5M', %s, NOW())
-            ON CONFLICT ON CONSTRAINT pd_arrays_unique DO NOTHING
-            """, (
-                arr['type'], arr['direction'],
-                arr['price_high'], arr['price_low'], arr['price_eq'],
-                arr['strength'], arr['candle_time']
-            ))
-            inserted += 1
-
         conn.commit()
 
-        # Stats
+        summary = []
+        total_inserted = 0
+        for tf_config in TIMEFRAMES_HTF:
+            n_obs, n_fvgs, n_ins = process_timeframe(cur, conn, tf_config, current_price)
+            summary.append(f"{tf_config['store_label']}: OB={n_obs} FVG={n_fvgs} ins={n_ins}")
+            total_inserted += n_ins
+
         cur.execute("SELECT COUNT(*) FROM pd_arrays_smc WHERE status='active' AND touched=0")
         active = cur.fetchone()[0]
 
         logging.info(
-            f"PD Arrays — {inserted} insérés, {active} actifs, "
-            f"prix={current_price}, bougies={len(rows)}, "
-            f"OB={len(obs)} FVG={len(fvgs)}"
+            f"PD Arrays — {total_inserted} inseres au total, {active} actifs, "
+            f"prix={current_price} | " + " | ".join(summary)
         )
 
     except Exception as e:

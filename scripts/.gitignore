@@ -1,0 +1,4 @@
+*_backup_avant_*.py
+*.bak
+*.bak_*
+.watchdog_price_state.json
