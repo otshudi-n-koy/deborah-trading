@@ -282,15 +282,20 @@ def run():
         reward = abs(tp - entry)
         rr     = round(reward / risk, 2)
 
-        # MIN_RR abaisse de 1.5 a 1.2 le 05/08/2026 (ticket Kanboard #43).
-        # Backtest de sensibilite (backtest_rr_sensitivity.py, confluence H1/H4
-        # obligatoire + buffer 5 pips + simulation reelle SL/TP) : SELL_LIMIT
-        # seul, MIN_RR=1.2 -> n=10/WR=80%/Kelly=+0.962 vs MIN_RR=1.5 (ancien)
-        # -> n=5/WR=60%/Kelly=+0.68. Pattern monotone sur 5 seuils testes
-        # (1.0/1.2/1.5/2.0/2.5), echantillon encore petit (n=10) a confirmer
-        # empiriquement sur trades reels post-patch.
-        if rr < 1.2:
-            logging.info(f'RR insuffisant: {rr} (min 1.2)')
+        # Seuils RR decouples par direction le 05/08/2026 (ticket Kanboard #43,
+        # backtest_rr_sensitivity.py). SELL_LIMIT (execute en prod) : MIN_RR=1.2
+        # -> n=10/WR=80%/Kelly=+0.962 (vs 1.5 ancien -> n=5/WR=60%/Kelly=+0.68).
+        # BUY_LIMIT (shadow uniquement, aucune execution) : profil different,
+        # MIN_RR=1.0 -> Kelly=+0.002 (quasi neutre, meilleur seuil observe) vs
+        # 1.2 deja negatif (Kelly=-0.102). Objectif : que le volume shadow BUY
+        # accumule reflete un filtre coherent avec son propre profil, pas celui
+        # de SELL, pour une future decision de reactivation basee sur des
+        # donnees representatives.
+        MIN_RR_SELL = 1.2
+        MIN_RR_BUY = 1.0
+        min_rr_applicable = MIN_RR_BUY if bias == 'BULLISH' else MIN_RR_SELL
+        if rr < min_rr_applicable:
+            logging.info(f'RR insuffisant: {rr} (min {min_rr_applicable} pour {"BUY" if bias == "BULLISH" else "SELL"})')
             return
 
         # 12. Calculer lot size
