@@ -228,6 +228,11 @@ def check_new_pd_array_near_price(cur):
     last_notified_id = get_state(cur, 'last_pd_array_near_id')
     if last_notified_id is None or int(last_notified_id) < arr_id:
         dist_pips = round(abs(arr_eq - price) * 10000, 1)
+        cur.execute("""
+            INSERT INTO agent_watched_zones (pd_array_id, notified_at, dist_pips_at_notification)
+            VALUES (%s, NOW(), %s)
+            ON CONFLICT (pd_array_id) DO NOTHING
+        """, (arr_id, dist_pips))
         send_telegram(
             f"📍 *NOUVELLE ZONE PROCHE* — {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"
             f"{arr_type} {direction} — HIGH={arr_high:.5f} LOW={arr_low:.5f}\n"
@@ -294,6 +299,64 @@ def check_delayed_fills(cur):
         set_state(cur, 'last_fill_notified_id', sig_id)
 
 
+def check_zone_invalidations(cur):
+    """
+    Suivi des zones precedemment notifiees (agent_watched_zones) : notifie
+    quand l'une d'elles passe a 'invalidated', avec la duree de vie observee
+    depuis la notification et la raison si deductible (prix qui l'a
+    traversee = mitigation reelle, vs simplement expiree/remplacee sans
+    jamais avoir ete testee par le prix).
+    Nettoie l'entree une fois traitee (qu'elle soit invalidee ou toujours
+    active, pour eviter que la table grossisse indefiniment - watch limite
+    a 48h par zone, au-dela on arrete de suivre silencieusement).
+    """
+    cur.execute("""
+        SELECT w.pd_array_id, w.notified_at, w.dist_pips_at_notification,
+               p.status, p.type, p.direction, p.invalidated_at,
+               p.price_high, p.price_low
+        FROM agent_watched_zones w
+        JOIN pd_arrays_smc p ON p.id = w.pd_array_id
+    """)
+    rows = cur.fetchall()
+    if not rows:
+        return
+
+    cur.execute("SELECT close FROM prices_smc WHERE timeframe='M5' ORDER BY candle_time DESC LIMIT 1")
+    price_row = cur.fetchone()
+    current_price = float(price_row[0]) if price_row else None
+
+    for r in rows:
+        (arr_id, notified_at, dist_at_notif, status, arr_type, direction,
+         invalidated_at, price_high, price_low) = r
+
+        age_min = None
+        if notified_at:
+            age_min = round((datetime.now(timezone.utc).replace(tzinfo=None) - notified_at).total_seconds() / 60)
+
+        if status == 'invalidated':
+            price_high, price_low = float(price_high), float(price_low)
+            # Deduction simple : si le prix actuel est DANS la zone (ou tres
+            # proche), l'invalidation vient probablement d'une mitigation
+            # reelle (le prix l'a traversee) ; sinon, plus probablement
+            # remplacee/expiree sans avoir ete testee.
+            reason = "raison inconnue"
+            if current_price is not None:
+                if price_low - 0.0003 <= current_price <= price_high + 0.0003:
+                    reason = "mitigee (prix a traverse la zone)"
+                else:
+                    reason = "expiree sans etre testee par le prix"
+
+            send_telegram(
+                f"⚫ *ZONE INVALIDEE* — {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"
+                f"{arr_type} {direction} — etait a {dist_at_notif}p a sa detection\n"
+                f"Duree de vie: {age_min} min | {reason}"
+            )
+            cur.execute("DELETE FROM agent_watched_zones WHERE pd_array_id=%s", (arr_id,))
+        elif age_min is not None and age_min > 48 * 60:
+            # Watch expire (48h), on arrete silencieusement le suivi
+            cur.execute("DELETE FROM agent_watched_zones WHERE pd_array_id=%s", (arr_id,))
+
+
 def run():
     conn = psycopg2.connect(**DB)
     cur = conn.cursor()
@@ -303,6 +366,7 @@ def run():
         check_streak(cur)
         check_choch_bos(cur)
         check_new_pd_array_near_price(cur)
+        check_zone_invalidations(cur)
         check_shadow_buy_qualified(cur)
         check_delayed_fills(cur)
         conn.commit()
