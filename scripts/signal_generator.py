@@ -111,15 +111,25 @@ def run():
             return
 
         # 2. Vérifier bot status
-        cur.execute("SELECT bot_status, capital_actuel, risk_pct_current, daily_pnl_pct, consecutive_losses FROM capital_smc WHERE id=1")
+        cur.execute("SELECT bot_status, pause_reason, capital_actuel, risk_pct_current, daily_pnl_pct, consecutive_losses FROM capital_smc WHERE id=1")
         cap = cur.fetchone()
         if not cap:
             logging.warning('Pas de données capital_smc')
             return
 
-        bot_status, capital_actuel, risk_pct, daily_pnl, consec_losses = cap
-        if bot_status != 'ACTIVE':
-            logging.info(f'Bot en pause: {bot_status}')
+        bot_status, pause_reason, capital_actuel, risk_pct, daily_pnl, consec_losses = cap
+        bot_active = (bot_status == 'ACTIVE')
+        # MODIF 06/08/2026 (suite ticket #45) : le cron horaire independant
+        # (crontab systeme, PAS ce script) bascule bot_status ACTIVE/PAUSE
+        # pour approximer les killzones (06h/09h/11h/14h/16h/21h UTC). Ce
+        # blocage etait totalement redondant avec check_killzone() et a
+        # empeche le shadow hors-killzone de fonctionner depuis son deploiement
+        # le 05/08 (confirme via un cas reel : confluence BEARISH etablie le
+        # 06/08 17:15 UTC hors killzone, aucune ligne generee dans
+        # signals_shadow_offhours). Seul le circuit breaker (DD reel, risque
+        # veritable) doit rester un blocage total sans evaluation shadow.
+        if not bot_active and pause_reason == 'CIRCUIT_BREAKER':
+            logging.info(f'Bot en pause (circuit breaker): {pause_reason}')
             return
 
         # 3. Circuit breaker
@@ -320,11 +330,13 @@ def run():
 
         # MODE SHADOW HORS-KILLZONE (05/08/2026, ticket Kanboard #45)
         # Tout setup valide (confluence+buffer+RR deja verifies plus haut)
-        # detecte hors des heures de killzone est logue ici, JAMAIS execute
-        # ni logue dans signals_smc/signals_shadow (reserve exclusivement
-        # au cas BUY suspendu EN killzone, pour ne pas melanger les
-        # populations statistiques). Concerne BUY et SELL indifferemment.
-        if not in_kz:
+        # detecte hors des heures de killzone OU pendant une pause programmee
+        # (bot_active=False mais pas circuit breaker, cf. patch 06/08/2026)
+        # est logue ici, JAMAIS execute ni logue dans signals_smc/signals_shadow
+        # (reserve exclusivement au cas BUY suspendu EN killzone, pour ne pas
+        # melanger les populations statistiques). Concerne BUY et SELL
+        # indifferemment.
+        if not in_kz or not bot_active:
             try:
                 _now_utc = datetime.now(timezone.utc)
                 cur.execute("""
