@@ -96,9 +96,14 @@ def run():
 
         # 1. Vérifier killzone
         kz = check_killzone()
-        if not kz['in_killzone']:
-            logging.debug(f'Hors killzone: {kz["session"]}')
-            return
+        in_kz = kz['in_killzone']
+        # MODIF 05/08/2026 (ticket Kanboard #45) : ne bloque plus ici. Le
+        # pipeline continue meme hors killzone, pour permettre le logging
+        # shadow des setups hors-heures (backtest_killzone_impact.py a montre
+        # un Kelly hors-killzone legerement positif +0.099 sur n=40, contre
+        # +0.703 en killzone sur n=13 - pas negatif, mais echantillon trop
+        # petit pour ouvrir l'execution reelle). L'execution reste reservee
+        # aux heures de killzone (voir plus bas).
 
         # 1b. Filtre NFP
         if is_nfp_window():
@@ -312,6 +317,29 @@ def run():
         if signal_type_allowed and signal_type != signal_type_allowed:
             logging.info(f'Signal {signal_type} bloque — biais {bias_db} autorise seulement {signal_type_allowed}')
             return
+
+        # MODE SHADOW HORS-KILLZONE (05/08/2026, ticket Kanboard #45)
+        # Tout setup valide (confluence+buffer+RR deja verifies plus haut)
+        # detecte hors des heures de killzone est logue ici, JAMAIS execute
+        # ni logue dans signals_smc/signals_shadow (reserve exclusivement
+        # au cas BUY suspendu EN killzone, pour ne pas melanger les
+        # populations statistiques). Concerne BUY et SELL indifferemment.
+        if not in_kz:
+            try:
+                _now_utc = datetime.now(timezone.utc)
+                cur.execute("""
+                    INSERT INTO signals_shadow_offhours
+                        (type, entry_price, sl_price, tp_price, sl_pips, tp_pips,
+                         rr_ratio, lot_size_hypothetique, hour_utc, weekday)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (signal_type, entry, sl, tp, sl_pips, tp_pips, rr, lot_size,
+                      _now_utc.hour, _now_utc.weekday()))
+                conn.commit()
+                logging.info(f'Setup {signal_type} logue en shadow offhours (entry={entry} rr={rr}, hors killzone)')
+            except Exception as e:
+                logging.error(f'Erreur log signals_shadow_offhours: {e}')
+            return
+
         # PAUSE BUY (16/07/2026) : BUY structurellement negatif (-7.54EUR/8 trades)
         # vs SELL positif (+22.80EUR/6 trades). Suspendu en attente d'un filtre
         # valide (CHoCH+BOS+OB+FVG+discount+liquidity sweep) backteste et calibre.
