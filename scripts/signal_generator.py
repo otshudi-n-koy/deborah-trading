@@ -390,7 +390,7 @@ def run():
                          rr_ratio, lot_size_hypothetique, killzone,
                          passed_choch_bos_filter, choch_level)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (signal_type, entry, sl, tp, sl_pips, tp_pips, rr, lot_size, killzone,
+                """, (signal_type, entry, sl, tp, sl_pips, tp_pips, rr, lot_size, kz['session'],
                       _choch_bos_passed, _choch_level))
                 conn.commit()
                 logging.info(f'Setup BUY logue en shadow (entry={entry} sl={sl} tp={tp} rr={rr} choch_bos={_choch_bos_passed})')
