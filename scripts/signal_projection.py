@@ -20,7 +20,14 @@ reste signal_generator.py ; ce module en est un miroir de lecture).
 MIN_SL = 0.00100        # identique a signal_generator.py
 SL_BUFFER = 0.00010      # identique a signal_generator.py
 ARRAY_BUFFER = 0.00050   # identique a signal_generator.py (5 pips depuis le 04/08/2026)
-MIN_RR = 1.5             # identique a signal_generator.py
+# MIN_RR decouple par direction le 05/08/2026 dans signal_generator.py
+# (ticket #43) - synchronise ici le 11/08/2026 apres decouverte d'une
+# desynchronisation (ce module etait reste a l'ancien seuil unique 1.5,
+# affiche a tort dans les briefings de l'agent pre-killzone : "minimum
+# requis 1.5" alors que la prod utilise reellement 1.2 pour SELL / 1.0
+# pour BUY depuis 6 jours).
+MIN_RR_SELL = 1.2
+MIN_RR_BUY = 1.0
 
 
 def compute_signal_projection(cur, bias, current_price):
@@ -101,8 +108,9 @@ def compute_signal_projection(cur, bias, current_price):
     risk = abs(entry - sl)
     reward = abs(tp - entry)
     rr = round(reward / risk, 2) if risk > 0 else 0
-    if rr < MIN_RR:
-        return None, f'RR insuffisant: {rr} (min {MIN_RR})'
+    min_rr_applicable = MIN_RR_BUY if bias == 'BULLISH' else MIN_RR_SELL
+    if rr < min_rr_applicable:
+        return None, f'RR insuffisant: {rr} (min {min_rr_applicable})'
 
     sl_pips = round(risk * 10000, 1)
     tp_pips = round(reward * 10000, 1)
