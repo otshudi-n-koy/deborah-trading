@@ -328,29 +328,14 @@ def run():
             logging.info(f'Signal {signal_type} bloque — biais {bias_db} autorise seulement {signal_type_allowed}')
             return
 
-        # MODE SHADOW HORS-KILLZONE (05/08/2026, ticket Kanboard #45)
-        # Tout setup valide (confluence+buffer+RR deja verifies plus haut)
-        # detecte hors des heures de killzone OU pendant une pause programmee
-        # (bot_active=False mais pas circuit breaker, cf. patch 06/08/2026)
-        # est logue ici, JAMAIS execute ni logue dans signals_smc/signals_shadow
-        # (reserve exclusivement au cas BUY suspendu EN killzone, pour ne pas
-        # melanger les populations statistiques). Concerne BUY et SELL
-        # indifferemment.
-        if not in_kz or not bot_active:
-            try:
-                _now_utc = datetime.now(timezone.utc)
-                cur.execute("""
-                    INSERT INTO signals_shadow_offhours
-                        (type, entry_price, sl_price, tp_price, sl_pips, tp_pips,
-                         rr_ratio, lot_size_hypothetique, hour_utc, weekday)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (signal_type, entry, sl, tp, sl_pips, tp_pips, rr, lot_size,
-                      _now_utc.hour, _now_utc.weekday()))
-                conn.commit()
-                logging.info(f'Setup {signal_type} logue en shadow offhours (entry={entry} rr={rr}, hors killzone)')
-            except Exception as e:
-                logging.error(f'Erreur log signals_shadow_offhours: {e}')
-            return
+        # RESTRUCTURATION 12/08/2026 : le patch offhours du 06/08 interceptait
+        # TOUS les BUY (y compris hors killzone) avant qu'ils n'atteignent le
+        # filtre CHoCH+BOS (ticket #38) - signals_shadow restait vide malgre
+        # la correction du bug killzone du 07/08. Le bloc generique BUY+SELL a
+        # ete retire d'ici : BUY route desormais directement vers le shadow
+        # CHoCH+BOS plus bas (peu importe l'heure, deja du shadow). SELL
+        # hors-heures route vers signals_shadow_offhours plus loin dans le
+        # bloc d'execution reelle (ticket #45).
 
         # PAUSE BUY (16/07/2026) : BUY structurellement negatif (-7.54EUR/8 trades)
         # vs SELL positif (+22.80EUR/6 trades). Suspendu en attente d'un filtre
@@ -396,6 +381,26 @@ def run():
                 logging.info(f'Setup BUY logue en shadow (entry={entry} sl={sl} tp={tp} rr={rr} choch_bos={_choch_bos_passed})')
             except Exception as e:
                 logging.error(f'Erreur log signals_shadow: {e}')
+            return
+
+        # MODE SHADOW HORS-KILLZONE, SELL UNIQUEMENT (12/08/2026, ticket #45)
+        # A ce stade signal_type est forcement SELL_LIMIT (BUY a deja return
+        # plus haut). Capture les setups SELL valides hors killzone/pause,
+        # jamais executes ni logues dans signals_smc.
+        if not in_kz or not bot_active:
+            try:
+                _now_utc = datetime.now(timezone.utc)
+                cur.execute("""
+                    INSERT INTO signals_shadow_offhours
+                        (type, entry_price, sl_price, tp_price, sl_pips, tp_pips,
+                         rr_ratio, lot_size_hypothetique, hour_utc, weekday)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (signal_type, entry, sl, tp, sl_pips, tp_pips, rr, lot_size,
+                      _now_utc.hour, _now_utc.weekday()))
+                conn.commit()
+                logging.info(f'Setup {signal_type} logue en shadow offhours (entry={entry} rr={rr})')
+            except Exception as e:
+                logging.error(f'Erreur log signals_shadow_offhours: {e}')
             return
 
         # 13. Insérer le signal
