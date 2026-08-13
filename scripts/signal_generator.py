@@ -11,6 +11,24 @@ import logging
 import requests
 from datetime import datetime, timezone
 import smc_choch_bos
+import os
+import sys
+
+# Verrou anti-chevauchement (12/08/2026, passage a cron 1 min - ticket #48)
+# Execution mesuree a 0.46s, marge tres confortable, mais garde-fou ajoute
+# par precaution avant le changement de frequence de cron.
+LOCK_FILE = '/tmp/signal_generator.lock'
+if os.path.exists(LOCK_FILE):
+    try:
+        with open(LOCK_FILE) as _lf:
+            _lock_age = datetime.now(timezone.utc).timestamp() - float(_lf.read().strip())
+        if _lock_age < 55:  # verrou recent, execution precedente probablement en cours
+            print(f"Verrou actif ({_lock_age:.1f}s), execution ignoree")
+            sys.exit(0)
+    except Exception:
+        pass  # verrou illisible/corrompu, on continue et on l'ecrase
+with open(LOCK_FILE, 'w') as _lf:
+    _lf.write(str(datetime.now(timezone.utc).timestamp()))
 
 LOG_FILE = '/opt/deborah-trading/scripts/signal_generator.log'
 logging.basicConfig(
@@ -728,5 +746,15 @@ def run_engulfing():
 
 
 if __name__ == '__main__':
-    run()
+    try:
+        run()
+    finally:
+        # Suppression du verrou anti-chevauchement, garantie meme en cas
+        # d'exception dans run() - sinon un cycle en erreur bloquerait
+        # les 55 prochaines secondes de cron pour rien.
+        try:
+            if os.path.exists(LOCK_FILE):
+                os.remove(LOCK_FILE)
+        except Exception:
+            pass
 #    run_engulfing()  # Desactive — WR 20.9% backtest 3 ans
