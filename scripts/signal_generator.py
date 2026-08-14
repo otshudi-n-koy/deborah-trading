@@ -386,6 +386,28 @@ def run():
             except Exception as _cbe:
                 logging.error(f'Erreur calcul filtre CHoCH/BOS shadow: {_cbe}')
                 _choch_bos_passed, _choch_level = None, None
+
+            # DEDUPLICATION 14/08/2026 : depuis le passage au cron 1 min
+            # (ticket #50), le meme setup encore valide etait reloque a
+            # chaque cycle (jusqu'a 10x le meme entry_price observe en
+            # quelques minutes) - faussait toute future stat WR/Kelly sur
+            # ce canal (un setup gagnant/perdant compterait plusieurs fois).
+            # On ne reinsere que si l'entry a change depuis la derniere ligne.
+            _skip_duplicate = False
+            try:
+                cur.execute("""
+                    SELECT entry_price FROM signals_shadow
+                    ORDER BY created_at DESC LIMIT 1
+                """)
+                _last_row = cur.fetchone()
+                if _last_row and abs(float(_last_row[0]) - entry) < 0.00001:
+                    _skip_duplicate = True
+            except Exception as _dde:
+                logging.error(f'Erreur check deduplication shadow: {_dde}')
+
+            if _skip_duplicate:
+                return
+
             try:
                 cur.execute("""
                     INSERT INTO signals_shadow
