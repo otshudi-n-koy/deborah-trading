@@ -215,6 +215,48 @@ def run():
         """)
         rows_4h = [{'candle_time': r[0], 'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4]} for r in cur.fetchall()]
 
+        # FIX 18/08/2026 (ticket #56) : l'API cTrader (ProtoOAGetTrendbarsReq)
+        # ne renvoie pas de mise a jour live pour la bougie H1/H4 en cours de
+        # formation - confirme sur 3 cycles consecutifs (close identique
+        # pendant 15 min malgre un vrai mouvement de marche visible sur M1).
+        # Consequence : current_close (donc swing_high/liquidity_target/TP)
+        # etait calcule sur un prix obsolete pendant tout le cycle en cours,
+        # jusqu'a 59 min de retard. On reconstruit ici la bougie en cours a
+        # partir des bougies M1 (flux actif depuis le 07/08, ticket #48),
+        # qui elles se mettent bien a jour en temps reel.
+        def _build_live_candle(rows_htf):
+            """Remplace la derniere bougie de rows_htf par une version
+            reconstruite depuis les M1 disponibles pour la periode en cours,
+            si des M1 plus recentes que cette derniere bougie existent."""
+            if not rows_htf:
+                return rows_htf
+            last_candle_time = rows_htf[-1]['candle_time']
+            cur.execute("""
+                SELECT candle_time, open, high, low, close
+                FROM prices_smc
+                WHERE timeframe = 'M1' AND candle_time >= %s
+                ORDER BY candle_time ASC
+            """, (last_candle_time,))
+            m1_rows = cur.fetchall()
+            if not m1_rows:
+                return rows_htf
+            live_open = float(m1_rows[0][1])
+            live_high = max(float(r[2]) for r in m1_rows)
+            live_low = min(float(r[3]) for r in m1_rows)
+            live_close = float(m1_rows[-1][4])
+            rows_htf = rows_htf[:-1] + [{
+                'candle_time': last_candle_time,
+                'open': live_open, 'high': live_high,
+                'low': live_low, 'close': live_close,
+            }]
+            return rows_htf
+
+        try:
+            rows_1h = _build_live_candle(rows_1h)
+            rows_4h = _build_live_candle(rows_4h)
+        except Exception as _le:
+            logging.error(f'Erreur construction bougie live M1: {_le}')
+
         if len(rows_1h) < 10:
             logging.warning(f'Pas assez de bougies 1H: {len(rows_1h)}')
             return
