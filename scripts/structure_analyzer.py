@@ -268,6 +268,21 @@ def run():
             s1h['liquidity_target']
         ))
 
+        try:
+            cur.execute("""
+                INSERT INTO structure_smc_history
+                (bias, h4_bias, confluence, zone_type, swing_high, swing_low,
+                 last_bos_price, last_mss_price, liquidity_target, eq50, recorded_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            """, (
+                s1h['bias'], s4h['bias'], confluence, s1h['zone_type'],
+                s1h['swing_high'], s1h['swing_low'],
+                s1h['last_bos_price'], s1h['last_mss_price'],
+                s1h['liquidity_target'], s1h['eq50']
+            ))
+        except Exception as _he:
+            logging.error(f'Erreur log structure_smc_history: {_he}')
+
         conn.commit()
         logging.info(
             f"Structure OK — bias={s1h['bias']} h4={s4h['bias']} "
