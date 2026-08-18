@@ -25,7 +25,18 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s'
 )
 
-BUFFER_NEUTRAL_PIPS = 0.0005  # 5 pips : zone tampon autour du point median
+# BUFFER_NEUTRAL_PIPS abaisse de 5 a 2 pips le 17/08/2026 (ticket #54).
+# Backtest de sensibilite (backtest_neutral_buffer_sensitivity.py) : le
+# biais H1 neutre dominait 26-57% du temps sur les jours de semaine recents
+# avec le seuil 5p, plus que l'ATR faible deja optimise (ticket #46).
+# Pattern monotone net : 0p -> 0% temps neutre/n=6/Kelly=+1.16 (meilleur),
+# 2p -> 13.3%/n=4/Kelly=+0.855, 5p (ancien) -> 27.1%/n=4/Kelly=+0.855 (meme
+# echantillon que 2p, pas de gain a garder 5p), 8p+ -> volume qui s'effondre
+# sans gain de qualite stable. Approche progressive et prudente retenue
+# (2p plutot que 0p directement) - le concept de zone neutre existe
+# probablement pour eviter le bruit de marche pres du point d'equilibre,
+# a valider en conditions reelles avant d'envisager une nouvelle baisse.
+BUFFER_NEUTRAL_PIPS = 0.0002  # 2 pips : zone tampon autour du point median
                                # avant de trancher un biais BULLISH/BEARISH
 
 def get_conn():
