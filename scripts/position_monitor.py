@@ -213,11 +213,11 @@ def close_position(cur, conn, sig_id, entry, exit_price, lots, pnl,
 
     if CTRADER_ENABLED and pos_id_to_check:
         try:
-            _pnl_sync = ctrader_ex.sync_real_pnl(sig_id)
+            _pnl_sync = ctrader_ex.sync_real_pnl(sig_id, trade_id)
             if _pnl_sync:
                 logger.info(f"Signal {sig_id} PnL reel synchronise: {_pnl_sync['pnl_net']}EUR")
             else:
-                logger.warning(f"Signal {sig_id} sync_real_pnl: pas de closePositionDetail (deal pas encore visible?)")
+                logger.warning(f"Signal {sig_id} sync_real_pnl: pas de closePositionDetail (deal pas encore visible?) — pnl_reconciler.py retentera")
         except Exception as _pe:
             logger.error(f"Signal {sig_id} sync_real_pnl erreur: {_pe}")
 
@@ -262,6 +262,19 @@ def set_tp_palier(cur, conn, sig_id, palier):
     conn.commit()
 
 
+def get_breakeven_fired(cur, sig_id):
+    """
+    Lit le flag breakeven_fired pose a l'evenement (voir bloc TRAILING/BREAKEVEN
+    dans run()), plutot que de le rededuire a la cloture depuis la position du SL
+    (proxy heuristique casse par le trailing qui deplace le SL apres le breakeven —
+    cf. diagnostic du 15/08/2026, breakeven_triggered toujours false en base malgre
+    des breakevens confirmes dans les logs).
+    """
+    cur.execute("SELECT breakeven_fired FROM signals_smc WHERE id=%s", (sig_id,))
+    row = cur.fetchone()
+    return bool(row[0]) if row and row[0] is not None else False
+
+
 def run():
     conn = None
     cur = None
@@ -284,12 +297,7 @@ def run():
                 pnl = (float(entry) - exit_price) * lots * 100000 if sig_type in ('SELL_LIMIT','SELL') \
                       else (exit_price - float(entry)) * lots * 100000
                 pnl_pct = round(pnl / 10000 * 100, 3)
-                _be_triggered_friday = None
-                try:
-                    if sl_pips_original:
-                        _be_triggered_friday = abs(float(sl) - float(entry)) < float(sl_pips_original) * PIP
-                except Exception:
-                    _be_triggered_friday = None
+                _be_triggered_friday = get_breakeven_fired(cur, sig_id)
                 cur.execute("UPDATE signals_smc SET status='closed', closed_at=NOW() WHERE id=%s", (sig_id,))
                 cur.execute("""
                     INSERT INTO trades_smc (signal_id, open_price, close_price, lot_size, pnl_eur, pnl_pct,
@@ -424,12 +432,7 @@ def run():
                     s_entry = float(s_entry); s_lots = float(s_lots)
                     pnl_cb = (price - s_entry)*s_lots*100000 if sig_type2 in ('BUY_LIMIT','BUY') \
                              else (s_entry - price)*s_lots*100000
-                    _be_triggered_cb = None
-                    try:
-                        if s_sl_pips and s_sl is not None:
-                            _be_triggered_cb = abs(float(s_sl) - float(s_entry)) < float(s_sl_pips) * PIP
-                    except Exception:
-                        _be_triggered_cb = None
+                    _be_triggered_cb = get_breakeven_fired(cur, sig_id2)
                     close_position(cur, conn, sig_id2, s_entry, price, s_lots, pnl_cb, sig_type2, s_kz,
                                    'WIN' if pnl_cb > 0 else 'LOSS', 'CIRCUIT_BREAKER', _be_triggered_cb)
                 cur.execute("UPDATE capital_smc SET bot_status='PAUSE', pause_reason='CIRCUIT_BREAKER', updated_at=NOW() WHERE id=1")
@@ -528,12 +531,7 @@ def run():
                                 _exit_reason = 'TP_HIT_LATE'
                             else:
                                 _exit_reason = 'MANUAL_CLOSE'
-                            _be_triggered_manual = None
-                            try:
-                                if mon_sl_pips:
-                                    _be_triggered_manual = abs(float(mon_sl_price) - float(mon_fill_price)) < float(mon_sl_pips) * _pip
-                            except Exception:
-                                _be_triggered_manual = None
+                            _be_triggered_manual = get_breakeven_fired(cur, mon_id)
                             cur.execute(
                                 "INSERT INTO trades_smc (signal_id, mt5_ticket, open_price, close_price, lot_size, pnl_eur, result, exit_reason, killzone, open_at, close_at, breakeven_triggered) "
                                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s) RETURNING id",
@@ -542,8 +540,21 @@ def run():
                             )
                             _manual_trade_id = cur.fetchone()[0]
                             cur.execute("UPDATE signals_smc SET status='closed', closed_at=NOW() WHERE id=%s", (mon_id,))
-                            cur.execute("UPDATE capital_smc SET capital_actuel=capital_actuel+%s, updated_at=NOW() WHERE id=1",
-                                        (_pnl_manual['pnl_net'],))
+                            # FIX 24/08/2026 : cette branche de reconciliation (fermeture
+                            # broker detectee, ex: trade #120/signal #97) faisait son propre
+                            # UPDATE capital_smc SANS jamais toucher consecutive_losses,
+                            # contrairement au chemin normal close_position() (ligne ~205).
+                            # Meme classe de bug que breakeven_triggered corrige le 03/08 -
+                            # deux chemins de cloture paralleles, un seul synchronise. Decouvert
+                            # en verifiant pourquoi consecutive_losses restait a 0 en base
+                            # malgre une vraie serie de 8 pertes consecutives (confirmee via
+                            # export CSV du broker). Consequence potentielle : circuit breaker
+                            # base sur ce compteur jamais declenche sur cette serie.
+                            cur.execute(
+                                "UPDATE capital_smc SET capital_actuel=capital_actuel+%s, "
+                                "consecutive_losses = CASE WHEN %s < 0 THEN consecutive_losses + 1 ELSE 0 END, "
+                                "updated_at=NOW() WHERE id=1",
+                                (_pnl_manual['pnl_net'], _pnl_manual['pnl_net']))
                             conn.commit()
                             logger.info(f"Signal {mon_id} cloture manuellement detectee et enregistree: pnl={_pnl_manual['pnl_net']}EUR (capital mis a jour)")
                             send_telegram(f"INFO - Signal #{mon_id} cloture broker detectee par reconciliation ({_exit_reason})\nPnL reel: {_pnl_manual['pnl_net']}EUR")
@@ -699,12 +710,7 @@ def run():
                         pnl_partial = (entry_exec - tp_level) * lots_to_close * 100000
 
                     palier_label = f'TP{palier_num}_PARTIAL'
-                    _be_triggered_partial = None
-                    try:
-                        if sl_pips_original:
-                            _be_triggered_partial = abs(float(sl) - float(entry)) < float(sl_pips_original) * PIP
-                    except Exception:
-                        _be_triggered_partial = None
+                    _be_triggered_partial = get_breakeven_fired(cur, sig_id)
                     pnl_pct_p, _ = close_partial(cur, conn, sig_id, entry, tp_level,
                                                   lots_to_close, pnl_partial, sig_type,
                                                   killzone, palier_label, lots_remaining,
@@ -756,6 +762,8 @@ def run():
                     (sig_type in ('BUY_LIMIT','BUY')  and price > entry)
                 ) else 0
                 new_sl = None
+                is_breakeven_event = False  # True seulement si new_sl vient d'un vrai
+                                             # breakeven (simple ou CHoCH), jamais du trailing
                 # BREAKEVEN AUTO — Option A+C
                 # Condition : bougie M5 entiere au-dessus entry + 3 pips (price_low confirme)
                 BE_MIN_PIPS = 3
@@ -763,9 +771,11 @@ def run():
                 if new_sl is None:
                     if sig_type in ("BUY_LIMIT","BUY") and price_low > entry + BE_MIN_PIPS * PIP and sl < entry:
                         new_sl = round(entry - BE_BUFFER_PIPS * PIP, 5)
+                        is_breakeven_event = True
                         logger.info(f"Signal {sig_id} BREAKEVEN CONFIRME (low={price_low:.5f} > entry+{BE_MIN_PIPS}p) SL -> {new_sl} (buffer {BE_BUFFER_PIPS}p)")
                     elif sig_type in ("SELL_LIMIT","SELL") and price_high < entry - BE_MIN_PIPS * PIP and sl > entry:
                         new_sl = round(entry + BE_BUFFER_PIPS * PIP, 5)
+                        is_breakeven_event = True
                         logger.info(f"Signal {sig_id} BREAKEVEN CONFIRME (high={price_high:.5f} < entry-{BE_MIN_PIPS}p) SL -> {new_sl} (buffer {BE_BUFFER_PIPS}p)")
                 palier_actuel = get_tp_palier(cur, sig_id)
 
@@ -786,6 +796,7 @@ def run():
                                 dist_pips = abs(price - choch_level) * 10000
                                 if dist_pips <= CHOCH_MAX_DIST_PIPS:
                                     new_sl = round(entry + BE_BUFFER_PIPS * PIP, 5)
+                                    is_breakeven_event = True
                                     logger.info(f'Signal {sig_id} BREAKEVEN CHOCH SL -> {new_sl} (buffer {BE_BUFFER_PIPS}p)')
                     if new_sl is None:
                         # sl_dist FIXE base sur sl_pips d'origine (immuable), PAS sur le
@@ -818,6 +829,7 @@ def run():
                                 dist_pips = abs(price - choch_level) * 10000
                                 if dist_pips <= CHOCH_MAX_DIST_PIPS:
                                     new_sl = round(entry - BE_BUFFER_PIPS * PIP, 5)
+                                    is_breakeven_event = True
                                     logger.info(f'Signal {sig_id} BREAKEVEN CHOCH SL -> {new_sl} (buffer {BE_BUFFER_PIPS}p)')
                     if new_sl is None:
                         # sl_dist FIXE base sur sl_pips d'origine (voir commentaire bloc SELL)
@@ -841,7 +853,10 @@ def run():
                             new_sl = max(new_sl, floor)
                         else:
                             new_sl = min(new_sl, floor)
-                    cur.execute("UPDATE signals_smc SET sl_price=%s WHERE id=%s", (new_sl, sig_id))
+                    cur.execute(
+                        "UPDATE signals_smc SET sl_price=%s, breakeven_fired = breakeven_fired OR %s WHERE id=%s",
+                        (new_sl, is_breakeven_event, sig_id)
+                    )
                     conn.commit()
                     sl = new_sl
                     # Synchronisation cTrader — amendment SL
@@ -881,12 +896,7 @@ def run():
                 if hours_open >= timeout:
                     action = 'TIMEOUT'
                     pnl = float_pnl
-                    _be_triggered_timeout = None
-                    try:
-                        if sl_pips_original:
-                            _be_triggered_timeout = abs(float(sl) - float(entry)) < float(sl_pips_original) * PIP
-                    except Exception:
-                        _be_triggered_timeout = None
+                    _be_triggered_timeout = get_breakeven_fired(cur, sig_id)
                     pnl_pct = close_position(cur, conn, sig_id, entry, price, lots, pnl,
                                              sig_type, killzone, 'WIN' if pnl > 0 else 'TIMEOUT',
                                              'TIMEOUT', _be_triggered_timeout)
@@ -916,12 +926,7 @@ def run():
                 result_label = 'WIN' if pnl > 0 else 'LOSS'
                 exit_reason = 'TRAILING' if sl > entry else 'HIT_SL'
 
-            _be_triggered = None
-            try:
-                if sl_pips_original:
-                    _be_triggered = abs(float(sl) - float(entry)) < float(sl_pips_original) * PIP
-            except Exception:
-                _be_triggered = None
+            _be_triggered = get_breakeven_fired(cur, sig_id)
             pnl_pct = close_position(cur, conn, sig_id, entry, exit_price, lots, pnl,
                                      sig_type, killzone, result_label, exit_reason, _be_triggered)
             sign = '+' if pnl >= 0 else ''
