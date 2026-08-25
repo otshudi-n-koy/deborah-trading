@@ -387,20 +387,21 @@ def run():
                 logging.error(f'Erreur calcul filtre CHoCH/BOS shadow: {_cbe}')
                 _choch_bos_passed, _choch_level = None, None
 
-            # DEDUPLICATION 14/08/2026 : depuis le passage au cron 1 min
-            # (ticket #50), le meme setup encore valide etait reloque a
-            # chaque cycle (jusqu'a 10x le meme entry_price observe en
-            # quelques minutes) - faussait toute future stat WR/Kelly sur
-            # ce canal (un setup gagnant/perdant compterait plusieurs fois).
-            # On ne reinsere que si l'entry a change depuis la derniere ligne.
+            # DEDUPLICATION 16/08/2026 (v2, remplace la version du 14/08) :
+            # dedup par entry_price (egalite < 0.00001) ne detectait pas les
+            # micro-variations d'un meme setup logique au fil des cycles (cron
+            # 1 min) : constat du 16/08 -> 39 lignes shadow pour seulement 8
+            # pd_array_id distincts sur ~25h (echantillon reel = 8, pas 39).
+            # Dedup desormais par pd_array_id : la zone PD array est la vraie
+            # unite de "setup", pas le prix exact qui derive legerement tant
+            # que la zone reste active. Un setup shadow = une ligne par zone,
+            # pour toujours (les id de pd_arrays_smc ne sont jamais reutilises).
             _skip_duplicate = False
             try:
                 cur.execute("""
-                    SELECT entry_price FROM signals_shadow
-                    ORDER BY created_at DESC LIMIT 1
-                """)
-                _last_row = cur.fetchone()
-                if _last_row and abs(float(_last_row[0]) - entry) < 0.00001:
+                    SELECT 1 FROM signals_shadow WHERE pd_array_id = %s LIMIT 1
+                """, (best_array['id'],))
+                if cur.fetchone():
                     _skip_duplicate = True
             except Exception as _dde:
                 logging.error(f'Erreur check deduplication shadow: {_dde}')
@@ -413,12 +414,12 @@ def run():
                     INSERT INTO signals_shadow
                         (type, entry_price, sl_price, tp_price, sl_pips, tp_pips,
                          rr_ratio, lot_size_hypothetique, killzone,
-                         passed_choch_bos_filter, choch_level)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         passed_choch_bos_filter, choch_level, pd_array_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (signal_type, entry, sl, tp, sl_pips, tp_pips, rr, lot_size, kz['session'],
-                      _choch_bos_passed, _choch_level))
+                      _choch_bos_passed, _choch_level, best_array['id']))
                 conn.commit()
-                logging.info(f'Setup BUY logue en shadow (entry={entry} sl={sl} tp={tp} rr={rr} choch_bos={_choch_bos_passed})')
+                logging.info(f'Setup BUY logue en shadow (entry={entry} sl={sl} tp={tp} rr={rr} choch_bos={_choch_bos_passed} pd_array_id={best_array["id"]})')
             except Exception as e:
                 logging.error(f'Erreur log signals_shadow: {e}')
             return
@@ -430,13 +431,15 @@ def run():
         if not in_kz or not bot_active:
             try:
                 _now_utc = datetime.now(timezone.utc)
+                # AJOUT 25/08/2026 (ticket #64) : entry_zone, meme logique
+                # diagnostique que signals_smc, aucun changement de comportement.
                 cur.execute("""
                     INSERT INTO signals_shadow_offhours
                         (type, entry_price, sl_price, tp_price, sl_pips, tp_pips,
-                         rr_ratio, lot_size_hypothetique, hour_utc, weekday)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         rr_ratio, lot_size_hypothetique, hour_utc, weekday, entry_zone)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (signal_type, entry, sl, tp, sl_pips, tp_pips, rr, lot_size,
-                      _now_utc.hour, _now_utc.weekday()))
+                      _now_utc.hour, _now_utc.weekday(), zone_type))
                 conn.commit()
                 logging.info(f'Setup {signal_type} logue en shadow offhours (entry={entry} rr={rr})')
             except Exception as e:
@@ -444,15 +447,23 @@ def run():
             return
 
         # 13. Insérer le signal
+        # AJOUT 25/08/2026 (ticket #64) : colonne entry_zone (PREMIUM/DISCOUNT/OTE)
+        # loguee a titre diagnostique uniquement - AUCUN changement de
+        # comportement, le signal est toujours execute normalement. Objectif :
+        # accumuler des donnees reelles pour valider (ou infirmer) en conditions
+        # live le backtest montrant qu'un SELL en zone DISCOUNT a un Kelly
+        # inferieur (+0.986 vs +1.441 en excluant discount, n=21 vs n=8 sur la
+        # periode testee). zone_type deja calcule par structure_analyzer.py,
+        # simplement reutilise ici sans recalcul.
         cur.execute("""
             INSERT INTO signals_smc
             (type, entry_price, sl_price, tp_price, lot_size, risk_pct,
-             sl_pips, tp_pips, rr_ratio, pd_array_id, killzone, status, created_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',NOW())
+             sl_pips, tp_pips, rr_ratio, pd_array_id, killzone, entry_zone, status, created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',NOW())
             RETURNING id
         """, (
             signal_type, entry, sl, tp, lot_size, risk_pct_f,
-            sl_pips, tp_pips, rr, best_array['id'], kz['session']
+            sl_pips, tp_pips, rr, best_array['id'], kz['session'], zone_type
         ))
         signal_id = cur.fetchone()[0]
 
