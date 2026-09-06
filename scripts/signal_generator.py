@@ -154,9 +154,21 @@ def run():
         if float(daily_pnl or 0) <= -3.5:
             logging.info(f'Circuit breaker: daily_pnl={daily_pnl}%')
             return
-        if int(consec_losses or 0) >= 3:
-            logging.info(f'Circuit breaker: {consec_losses} pertes consecutives — pause session')
-            return
+        # DESACTIVE le 06/09/2026 : ce seuil (>=3 pertes) bloquait TOUT le
+        # pipeline pendant 13 jours (24/08-06/09) suite a la correction du bug
+        # de comptage du meme jour (consecutive_losses etait fige a 0 avant,
+        # jamais atteint ce seuil). Analyse de la distribution historique des
+        # series de pertes : sur les 3 series ayant atteint ou depasse 3 pertes
+        # (longueurs 9, 4, 3), LES TROIS se sont resolues par un WIN par la
+        # suite. De plus, piege logique identifie : consecutive_losses ne peut
+        # redescendre a 0 que via un WIN (CASE WHEN pnl<0 THEN+1 ELSE 0 dans
+        # close_position()), mais aucun WIN n'est possible tant que ce meme
+        # seuil bloque toute generation de signal - impasse auto-entretenue
+        # sans sortie automatique. Le vrai filet de securite (DD_JOUR/DD_TOTAL,
+        # position_monitor.py ~L437-449) reste actif et independant.
+        # if int(consec_losses or 0) >= 3:
+        #     logging.info(f'Circuit breaker: {consec_losses} pertes consecutives — pause session')
+        #     return
         # Filtre biais session — DECOUPLAGE 04/08/2026 (ticket Kanboard refonte
         # agent pre-killzone) : bascule de capital_smc.session_bias (ecrit de
         # facon asynchrone par l'agent LLM, pouvait rester fige en cas de panne
