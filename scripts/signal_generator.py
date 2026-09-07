@@ -337,7 +337,12 @@ def run():
         # de SELL, pour une future decision de reactivation basee sur des
         # donnees representatives.
         MIN_RR_SELL = 1.2
-        MIN_RR_BUY = 1.0
+        # MIN_RR_BUY aligne de 1.0 a 1.2 le 07/09/2026 (ticket #70) : backtest
+        # de sensibilite sur pipeline complet (confluence H1+H4, ATR>=3p)
+        # montre Kelly=+1.258 a RR>=1.2 (n=35) vs +1.228 a RR>=1.0 (n=39) -
+        # legere amelioration de qualite, coherent avec le seuil SELL deja
+        # en place.
+        MIN_RR_BUY = 1.2
         min_rr_applicable = MIN_RR_BUY if bias == 'BULLISH' else MIN_RR_SELL
         if rr < min_rr_applicable:
             logging.info(f'RR insuffisant: {rr} (min {min_rr_applicable} pour {"BUY" if bias == "BULLISH" else "SELL"})')
@@ -346,13 +351,23 @@ def run():
         # 12. Calculer lot size
         capital     = float(capital_actuel)
         risk_pct_f  = float(risk_pct)
+        signal_type = 'BUY_LIMIT' if bias == 'BULLISH' else 'SELL_LIMIT'
+        # REACTIVATION BUY PRUDENTE 07/09/2026 (ticket #70) : risque reduit de
+        # moitie specifiquement pour BUY lors de cette phase de reactivation,
+        # apres suspension depuis le 16/07. Backtest reel sur 62 setups shadow
+        # deja generes (Kelly +0.513 sans filtre CHoCH+BOS) + backtest de
+        # sensibilite pipeline complet (Kelly +1.06 a +1.39 selon config) tous
+        # deux positifs et stables, mais premiere execution reelle depuis
+        # longtemps - prudence justifiee avant retour au risque plein.
+        # A retirer/aligner sur SELL une fois quelques semaines de resultats
+        # reels BUY confirmes.
+        if signal_type == 'BUY_LIMIT':
+            risk_pct_f = risk_pct_f / 2
         risk_eur    = capital * risk_pct_f
         sl_pips     = round(risk * 10000, 1)
         pip_value   = 10
         lot_size    = round(min(risk_eur / (sl_pips * pip_value), 2.0), 2)
         tp_pips     = round(reward * 10000, 1)
-
-        signal_type = 'BUY_LIMIT' if bias == 'BULLISH' else 'SELL_LIMIT'
         # Bloquer si biais contraire
         if signal_type_allowed and signal_type != signal_type_allowed:
             logging.info(f'Signal {signal_type} bloque — biais {bias_db} autorise seulement {signal_type_allowed}')
@@ -372,7 +387,7 @@ def run():
         # valide (CHoCH+BOS+OB+FVG+discount+liquidity sweep) backteste et calibre.
         # Retirer ce bloc une fois le filtre BUY valide et deploye.
         if signal_type == 'BUY_LIMIT':
-            logging.info('Signal BUY_LIMIT bloque — BUY en pause (perf negative, filtre en cours de calibration)')
+            logging.info('Signal BUY_LIMIT reactive (ticket #70) — execution reelle a risque reduit')
             # Mode SHADOW : on logue quand meme le setup qu'on aurait pris,
             # pour evaluer a posteriori sur 30-50 echantillons avant reactivation.
             # Ajout 03/08/2026 : flag passed_choch_bos_filter, calcule via le
@@ -434,11 +449,14 @@ def run():
                 logging.info(f'Setup BUY logue en shadow (entry={entry} sl={sl} tp={tp} rr={rr} choch_bos={_choch_bos_passed} pd_array_id={best_array["id"]})')
             except Exception as e:
                 logging.error(f'Erreur log signals_shadow: {e}')
-            return
+            # PLUS de return ici (ticket #70) : BUY continue desormais vers
+            # l'execution reelle, comme SELL. Le shadow logging ci-dessus est
+            # conserve a titre purement informatif/historique.
 
-        # MODE SHADOW HORS-KILLZONE, SELL UNIQUEMENT (12/08/2026, ticket #45)
-        # A ce stade signal_type est forcement SELL_LIMIT (BUY a deja return
-        # plus haut). Capture les setups SELL valides hors killzone/pause,
+        # MODE SHADOW HORS-KILLZONE (12/08/2026, ticket #45 - generalise le
+        # 07/09/2026 au ticket #70 : s'applique desormais a BUY et SELL, le
+        # SQL utilise deja signal_type dynamiquement, aucun changement de
+        # code necessaire ici). Capture les setups valides hors killzone/pause,
         # jamais executes ni logues dans signals_smc.
         if not in_kz or not bot_active:
             try:
