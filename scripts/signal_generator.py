@@ -358,6 +358,15 @@ def run():
         if bias == 'BULLISH' and zone_type == 'PREMIUM':
             logging.info(f'Signal BUY_LIMIT bloque — zone PREMIUM (regle symetrique #64)')
             return
+        # REGLE SYMETRIQUE INVERSE 09/09/2026 : pas de SELL en zone DISCOUNT.
+        # Backtestee et validee le 25/08 (ticket #64, Kelly +0.986 -> +1.441,
+        # n=21 -> n=8) mais JAMAIS deployee en execution reelle - seulement en
+        # shadow (entry_zone). Trade #102 (09/09, SELL en DISCOUNT) aurait ete
+        # bloque par cette regle : LOSS -0.95EUR. Gouvernance du 06/09 :
+        # application immediate plutot que d'attendre.
+        if bias == 'BEARISH' and zone_type == 'DISCOUNT':
+            logging.info(f'Signal SELL_LIMIT bloque — zone DISCOUNT (ticket #64)')
+            return
 
         # 12. Calculer lot size
         capital     = float(capital_actuel)
