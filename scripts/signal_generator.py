@@ -347,6 +347,17 @@ def run():
         if rr < min_rr_applicable:
             logging.info(f'RR insuffisant: {rr} (min {min_rr_applicable} pour {"BUY" if bias == "BULLISH" else "SELL"})')
             return
+        # REGLE SYMETRIQUE 09/09/2026 (ticket a consigner) : pas de BUY en zone
+        # PREMIUM, miroir exact de la regle 'pas de SELL en discount' (ticket
+        # #64, deployee le 25/08). Gouvernance du 06/09 : post-mortem
+        # systematique + application immediate plutot que d'attendre un grand
+        # echantillon. Sur les 3 premiers BUY reels post-reactivation (ticket
+        # #70) : le seul WIN etait en zone OTE, les 2 LOSS en PREMIUM.
+        # Backtest complet (29/06-09/09, pipeline entier) confirme : Kelly
+        # +1.201 (n=37, baseline) -> +1.456 (n=11) en excluant premium.
+        if bias == 'BULLISH' and zone_type == 'PREMIUM':
+            logging.info(f'Signal BUY_LIMIT bloque — zone PREMIUM (regle symetrique #64)')
+            return
 
         # 12. Calculer lot size
         capital     = float(capital_actuel)
