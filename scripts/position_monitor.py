@@ -349,13 +349,40 @@ def run():
         # 1bis. Annuler signaux PENDING dont la zone pd_array sous-jacente est invalidee
         # (race condition : la zone etait active a la creation du signal mais s'est
         # invalidee pendant que l'ordre LIMIT restait en attente de fill)
+        # FIX 10/09/2026 (ticket #73) : le SEUL fait que pd_array.status ne soit
+        # plus 'active' ne suffit plus a annuler l'ordre - un simple contact du
+        # prix DANS la zone (ce qui declenche normalement le remplissage de
+        # l'ordre LIMIT lui-meme) marquait deja la zone 'invalidated', causant
+        # l'annulation d'ordres au moment meme ou ils auraient du se remplir
+        # (cas reel: signal #103, prix entre dans la zone OB bullish a 16h30,
+        # annule a 16h40 au lieu de se remplir). Desormais on exige en plus
+        # une vraie cassure du cote protecteur de la zone (price_low pour
+        # bullish, price_high pour bearish) via le prix M5 le plus recent -
+        # un simple contact/retest ne declenche plus l'annulation.
         cur.execute("""
-            SELECT s.id, s.ctrader_order_id, p.id, p.status, s.entry_price
+            SELECT s.id, s.ctrader_order_id, p.id, p.status, s.entry_price,
+                   p.direction, p.price_low, p.price_high
             FROM signals_smc s
             JOIN pd_arrays_smc p ON s.pd_array_id = p.id
             WHERE s.status='pending' AND p.status != 'active'
         """)
-        to_cancel_ob = cur.fetchall()
+        to_cancel_ob_raw = cur.fetchall()
+        cur.execute("SELECT close FROM prices_smc WHERE timeframe='M5' ORDER BY candle_time DESC LIMIT 1")
+        _row_price = cur.fetchone()
+        _current_price = float(_row_price[0]) if _row_price else None
+        to_cancel_ob = []
+        for cxl_id, cxl_order_id, cxl_pd_id, cxl_pd_status, cxl_entry_price, cxl_direction, cxl_price_low, cxl_price_high in to_cancel_ob_raw:
+            if _current_price is None:
+                continue
+            cxl_price_low = float(cxl_price_low); cxl_price_high = float(cxl_price_high)
+            vraie_cassure = (
+                (cxl_direction == 'bullish' and _current_price < cxl_price_low) or
+                (cxl_direction == 'bearish' and _current_price > cxl_price_high)
+            )
+            if not vraie_cassure:
+                logger.info(f'Signal {cxl_id} pd_array {cxl_pd_id} touchee mais pas cassee (direction={cxl_direction}, prix={_current_price}, low={cxl_price_low}, high={cxl_price_high}) - ordre CONSERVE, laisse le temps de se remplir naturellement')
+                continue
+            to_cancel_ob.append((cxl_id, cxl_order_id, cxl_pd_id, cxl_pd_status, cxl_entry_price))
         for cxl_id, cxl_order_id, cxl_pd_id, cxl_pd_status, cxl_entry_price in to_cancel_ob:
             if cxl_order_id and CTRADER_ENABLED:
                 import subprocess as _sp4, json as _json4
