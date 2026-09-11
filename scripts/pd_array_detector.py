@@ -219,18 +219,32 @@ def run():
             return
         current_price = float(price_row[0])
 
-        # Invalider les PD Arrays touches par le prix (tous timeframes confondus,
-        # un niveau reste un niveau quel que soit le TF sur lequel il a ete detecte)
+        # Etape 1 : marquer 'touched' des que le prix entre reellement dans la
+        # zone. Corrige le bug ou 'touched' restait fige a 0 (diagnostique 11/09).
+        cur.execute("""
+            UPDATE pd_arrays_smc
+            SET touched = 1
+            WHERE status = 'active'
+            AND touched = 0
+            AND %s >= price_low AND %s <= price_high
+        """, (current_price, current_price))
+
+        # Etape 2 : invalider sur depassement de 10 pips au-dela de la limite
+        # opposee (pas 2 pips comme avant), au lieu d'un simple contact.
+        # Seuil valide par backtest_invalidation_threshold.py le 11/09 :
+        # 13 trades / WR 92.3% vs 9 trades / WR 88.9% en baseline (marge 2p).
+        # Desactiver completement l'invalidation est ecarte (WR chute a 60%,
+        # zones trop agees 11-24j produisent des entrees obsoletes).
         cur.execute("""
             UPDATE pd_arrays_smc
             SET status = 'invalidated', invalidated_at = NOW()
             WHERE status = 'active'
             AND (
-                (direction = 'bearish' AND %s >= price_low AND %s <= price_high + 0.00020)
+                (direction = 'bearish' AND %s > price_high + 0.00100)
                 OR
-                (direction = 'bullish' AND %s <= price_high AND %s >= price_low - 0.00020)
+                (direction = 'bullish' AND %s < price_low - 0.00100)
             )
-        """, (current_price, current_price, current_price, current_price))
+        """, (current_price, current_price))
         conn.commit()
 
         summary = []
