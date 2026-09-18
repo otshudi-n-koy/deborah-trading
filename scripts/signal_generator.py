@@ -355,8 +355,19 @@ def run():
         # #70) : le seul WIN etait en zone OTE, les 2 LOSS en PREMIUM.
         # Backtest complet (29/06-09/09, pipeline entier) confirme : Kelly
         # +1.201 (n=37, baseline) -> +1.456 (n=11) en excluant premium.
+        # DEDUPLICATION 18/09/2026 : sans elle, une zone qui reste matchee
+        # plusieurs cycles de cron d'affilee (confluence/ATR/RR toujours vrais)
+        # reloguait ce blocage a l'identique chaque minute - 626 lignes en 5
+        # jours pour probablement une poignee de zones distinctes reelles
+        # (meme classe de bug que celui corrige le 16/08 pour signals_shadow,
+        # 39 lignes pour 8 pd_array_id distincts). On ne logue qu'une fois par
+        # pd_array_id.
         if bias == 'BULLISH' and zone_type == 'PREMIUM':
-            logging.info(f'Signal BUY_LIMIT bloque — zone PREMIUM (regle symetrique #64)')
+            cur.execute("SELECT 1 FROM zone_blocks_logged WHERE pd_array_id = %s LIMIT 1", (best_array['id'],))
+            if not cur.fetchone():
+                logging.info(f'Signal BUY_LIMIT bloque — zone PREMIUM (regle symetrique #64) pd_array_id={best_array["id"]}')
+                cur.execute("INSERT INTO zone_blocks_logged (pd_array_id) VALUES (%s) ON CONFLICT DO NOTHING", (best_array['id'],))
+                conn.commit()
             return
         # REGLE SYMETRIQUE INVERSE 09/09/2026 : pas de SELL en zone DISCOUNT.
         # Backtestee et validee le 25/08 (ticket #64, Kelly +0.986 -> +1.441,
@@ -365,7 +376,11 @@ def run():
         # bloque par cette regle : LOSS -0.95EUR. Gouvernance du 06/09 :
         # application immediate plutot que d'attendre.
         if bias == 'BEARISH' and zone_type == 'DISCOUNT':
-            logging.info(f'Signal SELL_LIMIT bloque — zone DISCOUNT (ticket #64)')
+            cur.execute("SELECT 1 FROM zone_blocks_logged WHERE pd_array_id = %s LIMIT 1", (best_array['id'],))
+            if not cur.fetchone():
+                logging.info(f'Signal SELL_LIMIT bloque — zone DISCOUNT (ticket #64) pd_array_id={best_array["id"]}')
+                cur.execute("INSERT INTO zone_blocks_logged (pd_array_id) VALUES (%s) ON CONFLICT DO NOTHING", (best_array['id'],))
+                conn.commit()
             return
 
         # 12. Calculer lot size
