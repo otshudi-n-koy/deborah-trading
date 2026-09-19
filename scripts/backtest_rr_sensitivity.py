@@ -264,7 +264,7 @@ def compute_metrics(trades):
         'n_trades': n,
         'win_rate_pct': round(wr * 100, 1),
         'avg_rr_realized': round(avg_rr, 2),
-        'kelly_expectancy': round(kelly, 3),
+        'expectancy_r': round(kelly, 3),
         'buy_sell': dict(Counter(t['signal_type'] for t in trades)),
     }
 

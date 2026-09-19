@@ -490,7 +490,7 @@ def compute_metrics(results):
         'n_trades': n,
         'win_rate_pct': round(wr * 100, 2),
         'avg_rr_realized': round(avg_rr, 2),
-        'kelly_expectancy': round(kelly, 3),
+        'expectancy_r': round(kelly, 3),
         'exit_reason_distribution': dict(Counter(r['exit_reason'] for r in results)),
         'zone_type_distribution': dict(Counter(r['zone_type'] for r in results)),
     }

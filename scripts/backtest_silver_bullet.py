@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-backtest_atr_sensitivity.py
-Teste plusieurs seuils ATR_MIN_PIPS (signal_generator.py, actuellement fixe
-a 3.0 pips, jamais backteste) et simule le resultat reel de chaque signal
-genere pour calculer WR/RR realise/Kelly par seuil.
+backtest_silver_bullet.py
+Teste la fenetre "Silver Bullet" ICT (10h-11h heure de New York, soit
+15h-16h UTC en heure d'ete US/Europe) - une killzone plus resserree que
+les 3 sessions actuelles (LONDON/NEW_YORK/LONDON_CLOSE) - pour voir si
+elle concentre un edge superieur, sur le meme principe que le backtest
+killzone_impact deja valide (ticket #45).
 
-Reprend le pipeline complet valide dans backtest_rr_sensitivity.py
-(confluence H1/H4 obligatoire, buffer 5 pips, MIN_RR decouple par direction
-SELL=1.2/BUY=1.0), seule la variable testee change : le seuil ATR minimum
-requis pour generer un signal.
+Meme pipeline complet (confluence H1/H4, buffer PD array 5 pips,
+MIN_RR_SELL=1.2, ATR>=3p), seule la fenetre horaire testee change.
 
 Lecture seule sur la DB (aucun INSERT/UPDATE) - pur backtest offline.
 """
@@ -21,7 +21,7 @@ DB_CONFIG = {
     'dbname': 'trading', 'user': 'trading', 'password': 'Trading2026'
 }
 
-BUFFER_NEUTRAL_PIPS = 0.0005
+BUFFER_NEUTRAL_PIPS = 0.0002
 MIN_SIGNIFICANT_PIPS = 0.0010
 RECENT_LOOKBACK = 10
 ARRAY_BUFFER = 0.00050
@@ -29,6 +29,7 @@ MIN_SL = 0.00100
 SL_BUFFER = 0.00010
 MIN_RR_SELL = 1.2
 MIN_RR_BUY = 1.0
+ATR_MIN_PIPS = 3.0
 
 
 def get_conn():
@@ -110,6 +111,14 @@ def analyze_structure(candles, window_size=3):
             'liquidity_target': liq}
 
 
+def in_silver_bullet(dt):
+    """Fenetre Silver Bullet ICT : 10h-11h heure de New York = 15h-16h UTC
+    (approxime, ignore les changements d'heure d'ete US vs UTC exact)."""
+    if dt.weekday() >= 5:
+        return False
+    return 15 <= dt.hour < 16
+
+
 def load_candles(conn, timeframe, start_date):
     cur = conn.cursor()
     cur.execute("""
@@ -140,11 +149,10 @@ def load_pd_arrays(conn, start_date):
              'candle_time': r[6], 'invalidated_at': r[7]} for r in rows]
 
 
-def compute_atr_pips(m5_before, n=14):
-    """Moyenne (high-low) des n dernieres bougies M5 avant l'instant t, en pips."""
-    if len(m5_before) < n:
+def compute_atr_pips(candles_before, n=14):
+    if len(candles_before) < n:
         return 0
-    recent = m5_before[-n:]
+    recent = candles_before[-n:]
     avg_range = sum(c['high'] - c['low'] for c in recent) / n
     return round(avg_range * 10000, 1)
 
@@ -198,7 +206,7 @@ def try_build_signal(bias, current_price, active_arrays, struct):
         return None
 
     return {'signal_type': 'BUY_LIMIT' if bias == 'BULLISH' else 'SELL_LIMIT',
-            'entry': entry, 'sl': sl, 'tp': tp, 'rr_theoretical': rr}
+            'entry': entry, 'sl': sl, 'tp': tp}
 
 
 def simulate_trade(entry, sl, tp, bias, m5_after):
@@ -218,16 +226,18 @@ def simulate_trade(entry, sl, tp, bias, m5_after):
     return None, None
 
 
-def run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min_pips):
+def run_backtest(m5, h1, h4, pd_arrays, require_silver_bullet):
     LOOKBACK_H1 = 20 * 24
     LOOKBACK_H4 = 30 * 6
 
     trades = []
-    m5_by_time_idx = 0  # curseur avance dans m5 pour eviter re-scan complet
 
     for i in range(LOOKBACK_H1, len(h1)):
         h1_window = h1[max(0, i - LOOKBACK_H1):i + 1]
         t_now = h1_window[-1]['candle_time']
+
+        if require_silver_bullet and not in_silver_bullet(t_now):
+            continue
 
         struct_h1 = analyze_structure(h1_window, window_size=3)
         bias = struct_h1['bias']
@@ -238,13 +248,12 @@ def run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min_pips):
         if len(h4_window) < 7:
             continue
         struct_h4 = analyze_structure(h4_window, window_size=3)
-        confluence = (bias == struct_h4['bias'] and bias != 'NEUTRAL')
-        if not confluence:
+        if not (bias == struct_h4['bias'] and bias != 'NEUTRAL'):
             continue
 
         m5_before = [c for c in m5 if c['candle_time'] <= t_now]
         atr_pips = compute_atr_pips(m5_before, 14)
-        if atr_pips < atr_min_pips:
+        if atr_pips < ATR_MIN_PIPS:
             continue
 
         current_price = h1_window[-1]['close']
@@ -263,7 +272,8 @@ def run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min_pips):
         if result is None:
             continue
 
-        trades.append({'result': result, 'rr_real': rr_real, 'signal_type': sig['signal_type']})
+        trades.append({'result': result, 'rr_real': rr_real, 'signal_type': sig['signal_type'],
+                        'in_sb': in_silver_bullet(t_now)})
 
     return trades
 
@@ -296,14 +306,23 @@ if __name__ == '__main__':
     pd_arrays = load_pd_arrays(conn, START)
     print(f"M5={len(m5)} H1={len(h1)} H4={len(h4)} PD_arrays={len(pd_arrays)}\n")
 
-    thresholds = [0.0, 1.5, 3.0, 5.0, 8.0]
+    print("=== SCENARIO A : Silver Bullet uniquement (15h-16h UTC) ===")
+    trades_sb = run_backtest(m5, h1, h4, pd_arrays, require_silver_bullet=True)
+    metrics_sb = compute_metrics(trades_sb)
+    for k, v in metrics_sb.items():
+        print(f"  {k}: {v}")
 
-    for atr_min in thresholds:
-        print(f"=== ATR_MIN_PIPS = {atr_min} ===")
-        trades = run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min)
-        metrics = compute_metrics(trades)
-        for k, v in metrics.items():
-            print(f"  {k}: {v}")
-        print()
+    print("\n=== SCENARIO B : toutes heures (baseline, killzone actuelle ignoree) ===")
+    trades_all = run_backtest(m5, h1, h4, pd_arrays, require_silver_bullet=False)
+    metrics_all = compute_metrics(trades_all)
+    for k, v in metrics_all.items():
+        print(f"  {k}: {v}")
+
+    n_sb_in_all = len([t for t in trades_all if t['in_sb']])
+    trades_rest = [t for t in trades_all if not t['in_sb']]
+    metrics_rest = compute_metrics(trades_rest)
+    print(f"\n=== DETAIL : trades hors Silver Bullet (sous-ensemble de B) ===")
+    for k, v in metrics_rest.items():
+        print(f"  {k}: {v}")
 
     conn.close()

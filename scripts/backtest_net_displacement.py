@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
 """
-backtest_atr_sensitivity.py
-Teste plusieurs seuils ATR_MIN_PIPS (signal_generator.py, actuellement fixe
-a 3.0 pips, jamais backteste) et simule le resultat reel de chaque signal
-genere pour calculer WR/RR realise/Kelly par seuil.
+backtest_net_displacement.py
+Teste un filtre alternatif/complementaire a l'ATR : le deplacement NET du
+prix sur une fenetre glissante (ex: 60 min), independamment du bruit
+intra-bougie. Objectif : capter les tendances composees de petites bougies
+successives (ATR M5 individuel faible) mais qui avancent consistamment
+dans une direction - cas identifie le 18/08 soir (post-mortem), ou une
+cassure nette (16h20-17h35 UTC, ~130 pips cumules) a ete entierement
+ignoree faute d'ATR M5 suffisant (2.3-2.9p, sous le seuil 3p).
 
-Reprend le pipeline complet valide dans backtest_rr_sensitivity.py
-(confluence H1/H4 obligatoire, buffer 5 pips, MIN_RR decouple par direction
-SELL=1.2/BUY=1.0), seule la variable testee change : le seuil ATR minimum
-requis pour generer un signal.
+Condition testee : signal accepte si ATR>=3p (comme avant) OU deplacement
+net sur les N dernieres minutes >= seuil. Meme pipeline complet sinon
+(confluence H1/H4, buffer 5 pips, MIN_RR_SELL=1.2, buffer neutre 2 pips).
 
 Lecture seule sur la DB (aucun INSERT/UPDATE) - pur backtest offline.
 """
 
 import psycopg2
-from collections import Counter
 
 DB_CONFIG = {
     'host': 'localhost', 'port': 5432,
     'dbname': 'trading', 'user': 'trading', 'password': 'Trading2026'
 }
 
-BUFFER_NEUTRAL_PIPS = 0.0005
+BUFFER_NEUTRAL_PIPS = 0.0002
 MIN_SIGNIFICANT_PIPS = 0.0010
 RECENT_LOOKBACK = 10
 ARRAY_BUFFER = 0.00050
-MIN_SL = 0.00100
 SL_BUFFER = 0.00010
+MIN_SL = 0.00100
 MIN_RR_SELL = 1.2
-MIN_RR_BUY = 1.0
+ATR_MIN_PIPS = 3.0
 
 
 def get_conn():
@@ -38,10 +40,8 @@ def get_conn():
 def analyze_structure(candles, window_size=3):
     if len(candles) < window_size * 2 + 1:
         return {'bias': 'NEUTRAL', 'swing_high': None, 'swing_low': None, 'liquidity_target': None}
-
     candles = sorted(candles, key=lambda c: c['candle_time'])
     swing_highs, swing_lows = [], []
-
     for i in range(window_size, len(candles) - window_size):
         c = candles[i]
         is_high = all(candles[i - j]['high'] < c['high'] and candles[i + j]['high'] < c['high']
@@ -84,7 +84,6 @@ def analyze_structure(candles, window_size=3):
 
     last_hh, prev_hh = swing_highs[-1], swing_highs[-2]
     last_ll, prev_ll = swing_lows[-1], swing_lows[-2]
-
     recent = candles[-RECENT_LOOKBACK:]
     recent_low_val = min(c['low'] for c in recent)
     recent_high_val = max(c['high'] for c in recent)
@@ -98,14 +97,12 @@ def analyze_structure(candles, window_size=3):
     range_mid = (last_hh['price'] + last_ll['price']) / 2
     bias = 'NEUTRAL' if abs(current_close - range_mid) < BUFFER_NEUTRAL_PIPS \
         else ('BULLISH' if current_close > range_mid else 'BEARISH')
-
     lower_lows = [s for s in swing_lows if s['price'] < current_close]
     higher_highs = [s for s in swing_highs if s['price'] > current_close]
     if bias == 'BULLISH':
         liq = min(higher_highs, key=lambda s: s['price'])['price'] if higher_highs else round(current_close + 0.005, 5)
     else:
         liq = max(lower_lows, key=lambda s: s['price'])['price'] if lower_lows else round(current_close - 0.005, 5)
-
     return {'bias': bias, 'swing_high': last_hh['price'], 'swing_low': last_ll['price'],
             'liquidity_target': liq}
 
@@ -113,10 +110,8 @@ def analyze_structure(candles, window_size=3):
 def load_candles(conn, timeframe, start_date):
     cur = conn.cursor()
     cur.execute("""
-        SELECT candle_time, open, high, low, close
-        FROM prices_smc
-        WHERE timeframe = %s AND candle_time >= %s
-        ORDER BY candle_time ASC
+        SELECT candle_time, open, high, low, close FROM prices_smc
+        WHERE timeframe = %s AND candle_time >= %s ORDER BY candle_time ASC
     """, (timeframe, start_date))
     rows = cur.fetchall()
     cur.close()
@@ -127,11 +122,8 @@ def load_candles(conn, timeframe, start_date):
 def load_pd_arrays(conn, start_date):
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, type, direction, price_high, price_low, price_eq,
-               candle_time, invalidated_at
-        FROM pd_arrays_smc
-        WHERE timeframe = 'M5' AND candle_time >= %s
-        ORDER BY candle_time ASC
+        SELECT id, type, direction, price_high, price_low, price_eq, candle_time, invalidated_at
+        FROM pd_arrays_smc WHERE timeframe = 'M5' AND candle_time >= %s ORDER BY candle_time ASC
     """, (start_date,))
     rows = cur.fetchall()
     cur.close()
@@ -140,21 +132,26 @@ def load_pd_arrays(conn, start_date):
              'candle_time': r[6], 'invalidated_at': r[7]} for r in rows]
 
 
-def compute_atr_pips(m5_before, n=14):
-    """Moyenne (high-low) des n dernieres bougies M5 avant l'instant t, en pips."""
-    if len(m5_before) < n:
+def compute_atr_pips(candles_before, n=14):
+    if len(candles_before) < n:
         return 0
-    recent = m5_before[-n:]
+    recent = candles_before[-n:]
     avg_range = sum(c['high'] - c['low'] for c in recent) / n
     return round(avg_range * 10000, 1)
 
 
-def try_build_signal(bias, current_price, active_arrays, struct):
-    direction = 'bullish' if bias == 'BULLISH' else 'bearish'
-    candidates = [a for a in active_arrays if a['direction'] == direction]
+def compute_net_displacement_pips(candles_before, n_bars):
+    """Deplacement net (close actuel - close il y a n_bars bougies M5),
+    en valeur absolue, en pips. Mesure la tendance, pas le bruit."""
+    if len(candles_before) < n_bars + 1:
+        return 0
+    return round(abs(candles_before[-1]['close'] - candles_before[-1 - n_bars]['close']) * 10000, 1)
+
+
+def try_build_sell_signal(current_price, active_arrays, struct):
+    candidates = [a for a in active_arrays if a['direction'] == 'bearish']
     if not candidates:
         return None
-
     best_array = None
     for arr in candidates:
         if (current_price <= arr['price_high'] + ARRAY_BUFFER and
@@ -163,88 +160,71 @@ def try_build_signal(bias, current_price, active_arrays, struct):
             break
     if not best_array:
         return None
-
-    swing_high, swing_low, liq_target = struct['swing_high'], struct['swing_low'], struct['liquidity_target']
-    if swing_high is None or swing_low is None or liq_target is None:
+    swing_low, liq_target = struct['swing_low'], struct['liquidity_target']
+    if swing_low is None or liq_target is None:
         return None
-
-    if bias == 'BULLISH':
-        entry = best_array['price_eq']
-        sl = round(best_array['price_low'] - SL_BUFFER, 5)
-        if entry - sl < MIN_SL:
-            sl = round(entry - MIN_SL, 5)
-        tp = swing_high if liq_target < current_price + 0.0015 else liq_target
-        if tp <= current_price:
-            tp = liq_target
-        if tp <= entry:
-            return None
-        min_rr = MIN_RR_BUY
-    else:
-        entry = best_array['price_eq']
-        sl = round(best_array['price_high'] + SL_BUFFER, 5)
-        if sl - entry < MIN_SL:
-            sl = round(entry + MIN_SL, 5)
-        tp = swing_low if liq_target > current_price - 0.0015 else liq_target
-        if tp >= current_price:
-            tp = liq_target
-        if tp >= entry:
-            return None
-        min_rr = MIN_RR_SELL
-
+    entry = best_array['price_eq']
+    sl = round(best_array['price_high'] + SL_BUFFER, 5)
+    if sl - entry < MIN_SL:
+        sl = round(entry + MIN_SL, 5)
+    tp = swing_low if liq_target > current_price - 0.0015 else liq_target
+    if tp >= current_price:
+        tp = liq_target
+    if tp >= entry:
+        return None
     risk = abs(entry - sl)
     reward = abs(tp - entry)
     rr = round(reward / risk, 2) if risk > 0 else 0
-    if rr < min_rr:
+    if rr < MIN_RR_SELL:
         return None
-
-    return {'signal_type': 'BUY_LIMIT' if bias == 'BULLISH' else 'SELL_LIMIT',
-            'entry': entry, 'sl': sl, 'tp': tp, 'rr_theoretical': rr}
+    return {'entry': entry, 'sl': sl, 'tp': tp, 'rr': rr, 'pd_array_id': best_array['id']}
 
 
-def simulate_trade(entry, sl, tp, bias, m5_after):
+def simulate_trade(entry, sl, tp, m5_after):
     for c in m5_after:
-        if bias == 'BULLISH':
-            if c['low'] <= sl:
-                return 'LOSS', -1.0
-            if c['high'] >= tp:
-                rr_real = (tp - entry) / (entry - sl) if entry > sl else 0
-                return 'WIN', rr_real
-        else:
-            if c['high'] >= sl:
-                return 'LOSS', -1.0
-            if c['low'] <= tp:
-                rr_real = (entry - tp) / (sl - entry) if sl > entry else 0
-                return 'WIN', rr_real
+        if c['high'] >= sl:
+            return 'LOSS', -1.0
+        if c['low'] <= tp:
+            rr_real = (entry - tp) / (sl - entry) if sl > entry else 0
+            return 'WIN', rr_real
     return None, None
 
 
-def run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min_pips):
+def run_backtest(m5, h1, h4, pd_arrays, use_displacement, disp_n_bars=12, disp_min_pips=15):
+    """
+    use_displacement=False : comportement actuel (ATR seul)
+    use_displacement=True : accepte si ATR>=3p OU deplacement net sur
+    disp_n_bars bougies M5 (par defaut 12 = 60 min) >= disp_min_pips
+    """
     LOOKBACK_H1 = 20 * 24
     LOOKBACK_H4 = 30 * 6
-
     trades = []
-    m5_by_time_idx = 0  # curseur avance dans m5 pour eviter re-scan complet
+    n_would_add = 0  # setups qui passent uniquement grace au deplacement net
 
     for i in range(LOOKBACK_H1, len(h1)):
         h1_window = h1[max(0, i - LOOKBACK_H1):i + 1]
         t_now = h1_window[-1]['candle_time']
-
         struct_h1 = analyze_structure(h1_window, window_size=3)
         bias = struct_h1['bias']
-        if not bias or bias == 'NEUTRAL':
+        if bias != 'BEARISH':
             continue
-
         h4_window = [c for c in h4 if c['candle_time'] <= t_now][-LOOKBACK_H4:]
         if len(h4_window) < 7:
             continue
         struct_h4 = analyze_structure(h4_window, window_size=3)
-        confluence = (bias == struct_h4['bias'] and bias != 'NEUTRAL')
-        if not confluence:
+        if struct_h4['bias'] != 'BEARISH':
             continue
 
         m5_before = [c for c in m5 if c['candle_time'] <= t_now]
         atr_pips = compute_atr_pips(m5_before, 14)
-        if atr_pips < atr_min_pips:
+        atr_ok = atr_pips >= ATR_MIN_PIPS
+
+        disp_ok = False
+        if use_displacement and not atr_ok:
+            disp_pips = compute_net_displacement_pips(m5_before, disp_n_bars)
+            disp_ok = disp_pips >= disp_min_pips
+
+        if not (atr_ok or disp_ok):
             continue
 
         current_price = h1_window[-1]['close']
@@ -253,19 +233,21 @@ def run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min_pips):
             if a['candle_time'] <= t_now
             and (a['invalidated_at'] is None or a['invalidated_at'] > t_now)
         ]
-
-        sig = try_build_signal(bias, current_price, active_arrays, struct_h1)
+        sig = try_build_sell_signal(current_price, active_arrays, struct_h1)
         if not sig:
             continue
 
         m5_after = [c for c in m5 if c['candle_time'] > t_now][:2000]
-        result, rr_real = simulate_trade(sig['entry'], sig['sl'], sig['tp'], bias, m5_after)
+        result, rr_real = simulate_trade(sig['entry'], sig['sl'], sig['tp'], m5_after)
         if result is None:
             continue
 
-        trades.append({'result': result, 'rr_real': rr_real, 'signal_type': sig['signal_type']})
+        if disp_ok and not atr_ok:
+            n_would_add += 1
 
-    return trades
+        trades.append({'result': result, 'rr_real': rr_real})
+
+    return trades, n_would_add
 
 
 def compute_metrics(trades):
@@ -276,19 +258,13 @@ def compute_metrics(trades):
     wr = len(wins) / n
     avg_rr = sum(t['rr_real'] for t in wins) / len(wins) if wins else 0
     kelly = wr * avg_rr - (1 - wr)
-    return {
-        'n_trades': n,
-        'win_rate_pct': round(wr * 100, 1),
-        'avg_rr_realized': round(avg_rr, 2),
-        'expectancy_r': round(kelly, 3),
-        'buy_sell': dict(Counter(t['signal_type'] for t in trades)),
-    }
+    return {'n_trades': n, 'win_rate_pct': round(wr * 100, 1),
+            'avg_rr_realized': round(avg_rr, 2), 'expectancy_r': round(kelly, 3)}
 
 
 if __name__ == '__main__':
     conn = get_conn()
     START = '2026-06-29'
-
     print(f"Chargement des donnees depuis {START}...")
     m5 = load_candles(conn, 'M5', START)
     h1 = load_candles(conn, 'H1', START)
@@ -296,14 +272,30 @@ if __name__ == '__main__':
     pd_arrays = load_pd_arrays(conn, START)
     print(f"M5={len(m5)} H1={len(h1)} H4={len(h4)} PD_arrays={len(pd_arrays)}\n")
 
-    thresholds = [0.0, 1.5, 3.0, 5.0, 8.0]
+    print("=== SCENARIO A : ATR seul (actuel, baseline) ===")
+    trades_a, _ = run_backtest(m5, h1, h4, pd_arrays, use_displacement=False)
+    for k, v in compute_metrics(trades_a).items():
+        print(f"  {k}: {v}")
 
-    for atr_min in thresholds:
-        print(f"=== ATR_MIN_PIPS = {atr_min} ===")
-        trades = run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min)
-        metrics = compute_metrics(trades)
-        for k, v in metrics.items():
-            print(f"  {k}: {v}")
-        print()
+    print("\n=== SCENARIO B : ATR OU deplacement net >= 15p sur 60 min ===")
+    trades_b, added_b = run_backtest(m5, h1, h4, pd_arrays, use_displacement=True, disp_n_bars=12, disp_min_pips=15)
+    metrics_b = compute_metrics(trades_b)
+    for k, v in metrics_b.items():
+        print(f"  {k}: {v}")
+    print(f"  dont setups ajoutes uniquement par le deplacement net : {added_b}")
+
+    print("\n=== SCENARIO C : ATR OU deplacement net >= 20p sur 60 min ===")
+    trades_c, added_c = run_backtest(m5, h1, h4, pd_arrays, use_displacement=True, disp_n_bars=12, disp_min_pips=20)
+    metrics_c = compute_metrics(trades_c)
+    for k, v in metrics_c.items():
+        print(f"  {k}: {v}")
+    print(f"  dont setups ajoutes uniquement par le deplacement net : {added_c}")
+
+    print("\n=== SCENARIO D : ATR OU deplacement net >= 15p sur 30 min ===")
+    trades_d, added_d = run_backtest(m5, h1, h4, pd_arrays, use_displacement=True, disp_n_bars=6, disp_min_pips=15)
+    metrics_d = compute_metrics(trades_d)
+    for k, v in metrics_d.items():
+        print(f"  {k}: {v}")
+    print(f"  dont setups ajoutes uniquement par le deplacement net : {added_d}")
 
     conn.close()

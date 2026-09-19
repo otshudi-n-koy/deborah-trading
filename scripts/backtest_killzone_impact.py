@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-backtest_atr_sensitivity.py
-Teste plusieurs seuils ATR_MIN_PIPS (signal_generator.py, actuellement fixe
-a 3.0 pips, jamais backteste) et simule le resultat reel de chaque signal
-genere pour calculer WR/RR realise/Kelly par seuil.
+backtest_killzone_impact.py
+Isole l'impact de la restriction aux killzones (London/NY/London Close,
+check_killzone() dans signal_generator.py) sur le volume ET la qualite des
+signaux, en simulant le pipeline complet DEUX FOIS sur la meme periode :
+  - SCENARIO A (prod actuelle) : signal genere seulement en killzone
+  - SCENARIO B (contrefactuel) : signal genere a toute heure, 24h/24
+
+Objectif : verifier si la restriction killzone (pratique ICT standard,
+jamais backtestee en A/B sur ces donnees - seuls des backtests unilateraux
+"avec filtre session" existaient, cf. /root/backtest_with_session.py) ajoute
+reellement de la valeur ou coupe des opportunites valides.
 
 Reprend le pipeline complet valide dans backtest_rr_sensitivity.py
 (confluence H1/H4 obligatoire, buffer 5 pips, MIN_RR decouple par direction
-SELL=1.2/BUY=1.0), seule la variable testee change : le seuil ATR minimum
-requis pour generer un signal.
+comme en prod actuelle : SELL=1.2, BUY=1.0), seule la restriction horaire
+change entre les deux scenarios.
 
 Lecture seule sur la DB (aucun INSERT/UPDATE) - pur backtest offline.
 """
@@ -110,6 +117,24 @@ def analyze_structure(candles, window_size=3):
             'liquidity_target': liq}
 
 
+def in_killzone(dt):
+    """
+    Reproduit check_killzone() de signal_generator.py (heure Paris, approxime
+    en UTC+2 comme deja fait dans backtest_with_session.py - a affiner par
+    saison si besoin).
+    """
+    h_paris = (dt.hour + 2) % 24
+    if dt.weekday() >= 5:
+        return False
+    if 8 <= h_paris < 11:
+        return True
+    if 13 <= h_paris < 16:
+        return True
+    if 16 <= h_paris < 18:
+        return True
+    return False
+
+
 def load_candles(conn, timeframe, start_date):
     cur = conn.cursor()
     cur.execute("""
@@ -138,15 +163,6 @@ def load_pd_arrays(conn, start_date):
     return [{'id': r[0], 'type': r[1], 'direction': r[2], 'price_high': float(r[3]),
              'price_low': float(r[4]), 'price_eq': float(r[5]),
              'candle_time': r[6], 'invalidated_at': r[7]} for r in rows]
-
-
-def compute_atr_pips(m5_before, n=14):
-    """Moyenne (high-low) des n dernieres bougies M5 avant l'instant t, en pips."""
-    if len(m5_before) < n:
-        return 0
-    recent = m5_before[-n:]
-    avg_range = sum(c['high'] - c['low'] for c in recent) / n
-    return round(avg_range * 10000, 1)
 
 
 def try_build_signal(bias, current_price, active_arrays, struct):
@@ -218,16 +234,18 @@ def simulate_trade(entry, sl, tp, bias, m5_after):
     return None, None
 
 
-def run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min_pips):
+def run_backtest(m5, h1, h4, pd_arrays, require_killzone):
     LOOKBACK_H1 = 20 * 24
     LOOKBACK_H4 = 30 * 6
 
     trades = []
-    m5_by_time_idx = 0  # curseur avance dans m5 pour eviter re-scan complet
 
     for i in range(LOOKBACK_H1, len(h1)):
         h1_window = h1[max(0, i - LOOKBACK_H1):i + 1]
         t_now = h1_window[-1]['candle_time']
+
+        if require_killzone and not in_killzone(t_now):
+            continue
 
         struct_h1 = analyze_structure(h1_window, window_size=3)
         bias = struct_h1['bias']
@@ -240,11 +258,6 @@ def run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min_pips):
         struct_h4 = analyze_structure(h4_window, window_size=3)
         confluence = (bias == struct_h4['bias'] and bias != 'NEUTRAL')
         if not confluence:
-            continue
-
-        m5_before = [c for c in m5 if c['candle_time'] <= t_now]
-        atr_pips = compute_atr_pips(m5_before, 14)
-        if atr_pips < atr_min_pips:
             continue
 
         current_price = h1_window[-1]['close']
@@ -263,7 +276,8 @@ def run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min_pips):
         if result is None:
             continue
 
-        trades.append({'result': result, 'rr_real': rr_real, 'signal_type': sig['signal_type']})
+        trades.append({'result': result, 'rr_real': rr_real, 'signal_type': sig['signal_type'],
+                        'time': t_now, 'in_killzone': in_killzone(t_now)})
 
     return trades
 
@@ -296,14 +310,31 @@ if __name__ == '__main__':
     pd_arrays = load_pd_arrays(conn, START)
     print(f"M5={len(m5)} H1={len(h1)} H4={len(h4)} PD_arrays={len(pd_arrays)}\n")
 
-    thresholds = [0.0, 1.5, 3.0, 5.0, 8.0]
+    print("=== SCENARIO A (killzone obligatoire, PROD ACTUELLE) ===")
+    trades_a = run_backtest(m5, h1, h4, pd_arrays, require_killzone=True)
+    metrics_a = compute_metrics(trades_a)
+    for k, v in metrics_a.items():
+        print(f"  {k}: {v}")
 
-    for atr_min in thresholds:
-        print(f"=== ATR_MIN_PIPS = {atr_min} ===")
-        trades = run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min)
-        metrics = compute_metrics(trades)
-        for k, v in metrics.items():
-            print(f"  {k}: {v}")
-        print()
+    print("\n=== SCENARIO B (24h/24, sans restriction killzone) ===")
+    trades_b = run_backtest(m5, h1, h4, pd_arrays, require_killzone=False)
+    metrics_b = compute_metrics(trades_b)
+    for k, v in metrics_b.items():
+        print(f"  {k}: {v}")
+
+    n_b_in_kz = len([t for t in trades_b if t['in_killzone']])
+    n_b_out_kz = len([t for t in trades_b if not t['in_killzone']])
+    print(f"\n=== DETAIL SCENARIO B ===")
+    print(f"  Trades qui seraient tombes EN killzone: {n_b_in_kz}")
+    print(f"  Trades qui seraient tombes HORS killzone: {n_b_out_kz}")
+
+    trades_b_out = [t for t in trades_b if not t['in_killzone']]
+    metrics_b_out = compute_metrics(trades_b_out)
+    print(f"\n=== METRIQUES DES TRADES HORS-KILLZONE UNIQUEMENT (scenario B) ===")
+    for k, v in metrics_b_out.items():
+        print(f"  {k}: {v}")
+
+    print(f"\n=== IMPACT ISOLE DE LA RESTRICTION KILLZONE ===")
+    print(f"Trades supplementaires generes SANS restriction killzone: {len(trades_b) - len(trades_a)}")
 
     conn.close()

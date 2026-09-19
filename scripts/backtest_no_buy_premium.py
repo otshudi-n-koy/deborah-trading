@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
 """
-backtest_atr_sensitivity.py
-Teste plusieurs seuils ATR_MIN_PIPS (signal_generator.py, actuellement fixe
-a 3.0 pips, jamais backteste) et simule le resultat reel de chaque signal
-genere pour calculer WR/RR realise/Kelly par seuil.
+backtest_no_buy_premium.py
+Regle symetrique au ticket #64 (pas de SELL en discount) : interdire le
+BUY si l'entree se situe en zone PREMIUM (au-dessus de l'equilibre H1,
+range_mid = (swing_high+swing_low)/2).
 
-Reprend le pipeline complet valide dans backtest_rr_sensitivity.py
-(confluence H1/H4 obligatoire, buffer 5 pips, MIN_RR decouple par direction
-SELL=1.2/BUY=1.0), seule la variable testee change : le seuil ATR minimum
-requis pour generer un signal.
+Origine: sur les 3 premiers trades BUY reels depuis la reactivation
+(ticket #70, 07/09), le seul WIN etait en zone OTE, les 2 LOSS etaient
+tous les deux en zone PREMIUM.
+
+Meme pipeline complet que tous les backtests de la semaine (confluence
+H1/H4, buffer PD array 5 pips, MIN_RR_BUY=1.2, ATR>=3p, buffer neutre 2p,
+contrainte une position a la fois).
 
 Lecture seule sur la DB (aucun INSERT/UPDATE) - pur backtest offline.
 """
 
 import psycopg2
-from collections import Counter
 
 DB_CONFIG = {
     'host': 'localhost', 'port': 5432,
     'dbname': 'trading', 'user': 'trading', 'password': 'Trading2026'
 }
 
-BUFFER_NEUTRAL_PIPS = 0.0005
+BUFFER_NEUTRAL_PIPS = 0.0002
 MIN_SIGNIFICANT_PIPS = 0.0010
 RECENT_LOOKBACK = 10
 ARRAY_BUFFER = 0.00050
-MIN_SL = 0.00100
 SL_BUFFER = 0.00010
-MIN_RR_SELL = 1.2
-MIN_RR_BUY = 1.0
+MIN_SL = 0.00100
+MIN_RR_BUY = 1.2
+ATR_MIN_PIPS = 3.0
 
 
 def get_conn():
@@ -37,11 +39,10 @@ def get_conn():
 
 def analyze_structure(candles, window_size=3):
     if len(candles) < window_size * 2 + 1:
-        return {'bias': 'NEUTRAL', 'swing_high': None, 'swing_low': None, 'liquidity_target': None}
-
+        return {'bias': 'NEUTRAL', 'swing_high': None, 'swing_low': None,
+                'liquidity_target': None, 'range_mid': None}
     candles = sorted(candles, key=lambda c: c['candle_time'])
     swing_highs, swing_lows = [], []
-
     for i in range(window_size, len(candles) - window_size):
         c = candles[i]
         is_high = all(candles[i - j]['high'] < c['high'] and candles[i + j]['high'] < c['high']
@@ -80,11 +81,10 @@ def analyze_structure(candles, window_size=3):
         bias = 'NEUTRAL' if abs(current_close - eq50) < BUFFER_NEUTRAL_PIPS \
             else ('BEARISH' if current_close < eq50 else 'BULLISH')
         return {'bias': bias, 'swing_high': fH, 'swing_low': fL,
-                'liquidity_target': fL if bias == 'BEARISH' else fH}
+                'liquidity_target': fL if bias == 'BEARISH' else fH, 'range_mid': eq50}
 
     last_hh, prev_hh = swing_highs[-1], swing_highs[-2]
     last_ll, prev_ll = swing_lows[-1], swing_lows[-2]
-
     recent = candles[-RECENT_LOOKBACK:]
     recent_low_val = min(c['low'] for c in recent)
     recent_high_val = max(c['high'] for c in recent)
@@ -98,25 +98,21 @@ def analyze_structure(candles, window_size=3):
     range_mid = (last_hh['price'] + last_ll['price']) / 2
     bias = 'NEUTRAL' if abs(current_close - range_mid) < BUFFER_NEUTRAL_PIPS \
         else ('BULLISH' if current_close > range_mid else 'BEARISH')
-
     lower_lows = [s for s in swing_lows if s['price'] < current_close]
     higher_highs = [s for s in swing_highs if s['price'] > current_close]
     if bias == 'BULLISH':
         liq = min(higher_highs, key=lambda s: s['price'])['price'] if higher_highs else round(current_close + 0.005, 5)
     else:
         liq = max(lower_lows, key=lambda s: s['price'])['price'] if lower_lows else round(current_close - 0.005, 5)
-
     return {'bias': bias, 'swing_high': last_hh['price'], 'swing_low': last_ll['price'],
-            'liquidity_target': liq}
+            'liquidity_target': liq, 'range_mid': range_mid}
 
 
 def load_candles(conn, timeframe, start_date):
     cur = conn.cursor()
     cur.execute("""
-        SELECT candle_time, open, high, low, close
-        FROM prices_smc
-        WHERE timeframe = %s AND candle_time >= %s
-        ORDER BY candle_time ASC
+        SELECT candle_time, open, high, low, close FROM prices_smc
+        WHERE timeframe = %s AND candle_time >= %s ORDER BY candle_time ASC
     """, (timeframe, start_date))
     rows = cur.fetchall()
     cur.close()
@@ -127,11 +123,8 @@ def load_candles(conn, timeframe, start_date):
 def load_pd_arrays(conn, start_date):
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, type, direction, price_high, price_low, price_eq,
-               candle_time, invalidated_at
-        FROM pd_arrays_smc
-        WHERE timeframe = 'M5' AND candle_time >= %s
-        ORDER BY candle_time ASC
+        SELECT id, type, direction, price_high, price_low, price_eq, candle_time, invalidated_at
+        FROM pd_arrays_smc WHERE timeframe = 'M5' AND candle_time >= %s ORDER BY candle_time ASC
     """, (start_date,))
     rows = cur.fetchall()
     cur.close()
@@ -140,21 +133,18 @@ def load_pd_arrays(conn, start_date):
              'candle_time': r[6], 'invalidated_at': r[7]} for r in rows]
 
 
-def compute_atr_pips(m5_before, n=14):
-    """Moyenne (high-low) des n dernieres bougies M5 avant l'instant t, en pips."""
-    if len(m5_before) < n:
+def compute_atr_pips(candles_before, n=14):
+    if len(candles_before) < n:
         return 0
-    recent = m5_before[-n:]
+    recent = candles_before[-n:]
     avg_range = sum(c['high'] - c['low'] for c in recent) / n
     return round(avg_range * 10000, 1)
 
 
-def try_build_signal(bias, current_price, active_arrays, struct):
-    direction = 'bullish' if bias == 'BULLISH' else 'bearish'
-    candidates = [a for a in active_arrays if a['direction'] == direction]
+def try_build_buy_signal(current_price, active_arrays, struct):
+    candidates = [a for a in active_arrays if a['direction'] == 'bullish']
     if not candidates:
         return None
-
     best_array = None
     for arr in candidates:
         if (current_price <= arr['price_high'] + ARRAY_BUFFER and
@@ -163,109 +153,100 @@ def try_build_signal(bias, current_price, active_arrays, struct):
             break
     if not best_array:
         return None
-
-    swing_high, swing_low, liq_target = struct['swing_high'], struct['swing_low'], struct['liquidity_target']
-    if swing_high is None or swing_low is None or liq_target is None:
+    swing_high, liq_target = struct['swing_high'], struct['liquidity_target']
+    if swing_high is None or liq_target is None:
         return None
-
-    if bias == 'BULLISH':
-        entry = best_array['price_eq']
-        sl = round(best_array['price_low'] - SL_BUFFER, 5)
-        if entry - sl < MIN_SL:
-            sl = round(entry - MIN_SL, 5)
-        tp = swing_high if liq_target < current_price + 0.0015 else liq_target
-        if tp <= current_price:
-            tp = liq_target
-        if tp <= entry:
-            return None
-        min_rr = MIN_RR_BUY
-    else:
-        entry = best_array['price_eq']
-        sl = round(best_array['price_high'] + SL_BUFFER, 5)
-        if sl - entry < MIN_SL:
-            sl = round(entry + MIN_SL, 5)
-        tp = swing_low if liq_target > current_price - 0.0015 else liq_target
-        if tp >= current_price:
-            tp = liq_target
-        if tp >= entry:
-            return None
-        min_rr = MIN_RR_SELL
-
+    entry = best_array['price_eq']
+    sl = round(best_array['price_low'] - SL_BUFFER, 5)
+    if entry - sl < MIN_SL:
+        sl = round(entry - MIN_SL, 5)
+    tp = swing_high if liq_target < current_price + 0.0015 else liq_target
+    if tp <= current_price:
+        tp = liq_target
+    if tp <= entry:
+        return None
     risk = abs(entry - sl)
     reward = abs(tp - entry)
     rr = round(reward / risk, 2) if risk > 0 else 0
-    if rr < min_rr:
+    if rr < MIN_RR_BUY:
         return None
-
-    return {'signal_type': 'BUY_LIMIT' if bias == 'BULLISH' else 'SELL_LIMIT',
-            'entry': entry, 'sl': sl, 'tp': tp, 'rr_theoretical': rr}
+    return {'entry': entry, 'sl': sl, 'tp': tp, 'rr': rr, 'pd_array_id': best_array['id']}
 
 
-def simulate_trade(entry, sl, tp, bias, m5_after):
+def simulate_trade(entry, sl, tp, m5_after):
     for c in m5_after:
-        if bias == 'BULLISH':
-            if c['low'] <= sl:
-                return 'LOSS', -1.0
-            if c['high'] >= tp:
-                rr_real = (tp - entry) / (entry - sl) if entry > sl else 0
-                return 'WIN', rr_real
-        else:
-            if c['high'] >= sl:
-                return 'LOSS', -1.0
-            if c['low'] <= tp:
-                rr_real = (entry - tp) / (sl - entry) if sl > entry else 0
-                return 'WIN', rr_real
+        if c['low'] <= sl:
+            return 'LOSS', -1.0
+        if c['high'] >= tp:
+            rr_real = (tp - entry) / (entry - sl) if entry > sl else 0
+            return 'WIN', rr_real
     return None, None
 
 
-def run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min_pips):
+def run_backtest(m5, h1, h4, pd_arrays, require_not_premium):
     LOOKBACK_H1 = 20 * 24
     LOOKBACK_H4 = 30 * 6
-
     trades = []
-    m5_by_time_idx = 0  # curseur avance dans m5 pour eviter re-scan complet
+    n_blocked_by_premium = 0
+    blocked_until = None
 
-    for i in range(LOOKBACK_H1, len(h1)):
-        h1_window = h1[max(0, i - LOOKBACK_H1):i + 1]
-        t_now = h1_window[-1]['candle_time']
+    for i in range(RECENT_LOOKBACK, len(m5)):
+        t_now = m5[i]['candle_time']
+        if blocked_until is not None and t_now <= blocked_until:
+            continue
 
+        h1_window = [c for c in h1 if c['candle_time'] <= t_now][-LOOKBACK_H1:]
+        if len(h1_window) < 10:
+            continue
         struct_h1 = analyze_structure(h1_window, window_size=3)
-        bias = struct_h1['bias']
-        if not bias or bias == 'NEUTRAL':
+        if struct_h1['bias'] != 'BULLISH':
             continue
 
         h4_window = [c for c in h4 if c['candle_time'] <= t_now][-LOOKBACK_H4:]
         if len(h4_window) < 7:
             continue
         struct_h4 = analyze_structure(h4_window, window_size=3)
-        confluence = (bias == struct_h4['bias'] and bias != 'NEUTRAL')
-        if not confluence:
+        if struct_h4['bias'] != 'BULLISH':
             continue
 
-        m5_before = [c for c in m5 if c['candle_time'] <= t_now]
-        atr_pips = compute_atr_pips(m5_before, 14)
-        if atr_pips < atr_min_pips:
+        atr_before = [c for c in m5 if c['candle_time'] <= t_now][-14:]
+        if compute_atr_pips(atr_before, 14) < ATR_MIN_PIPS:
             continue
 
-        current_price = h1_window[-1]['close']
+        current_price = m5[i]['close']
         active_arrays = [
             a for a in pd_arrays
             if a['candle_time'] <= t_now
             and (a['invalidated_at'] is None or a['invalidated_at'] > t_now)
         ]
-
-        sig = try_build_signal(bias, current_price, active_arrays, struct_h1)
+        sig = try_build_buy_signal(current_price, active_arrays, struct_h1)
         if not sig:
             continue
 
-        m5_after = [c for c in m5 if c['candle_time'] > t_now][:2000]
-        result, rr_real = simulate_trade(sig['entry'], sig['sl'], sig['tp'], bias, m5_after)
+        if require_not_premium:
+            range_mid = struct_h1['range_mid']
+            if range_mid is not None and sig['entry'] > range_mid:
+                n_blocked_by_premium += 1
+                continue
+
+        if trades and trades[-1]['pd_array_id'] == sig['pd_array_id']:
+            continue
+
+        m5_after = m5[i + 1:i + 2001]
+        result, rr_real = simulate_trade(sig['entry'], sig['sl'], sig['tp'], m5_after)
         if result is None:
             continue
 
-        trades.append({'result': result, 'rr_real': rr_real, 'signal_type': sig['signal_type']})
+        resolved_at = None
+        for c_after in m5_after:
+            if c_after['low'] <= sig['sl'] or c_after['high'] >= sig['tp']:
+                resolved_at = c_after['candle_time']
+                break
+        blocked_until = resolved_at
 
-    return trades
+        trades.append({**sig, 'time': t_now, 'result': result, 'rr_real': rr_real})
+
+    return trades, n_blocked_by_premium
 
 
 def compute_metrics(trades):
@@ -276,13 +257,8 @@ def compute_metrics(trades):
     wr = len(wins) / n
     avg_rr = sum(t['rr_real'] for t in wins) / len(wins) if wins else 0
     kelly = wr * avg_rr - (1 - wr)
-    return {
-        'n_trades': n,
-        'win_rate_pct': round(wr * 100, 1),
-        'avg_rr_realized': round(avg_rr, 2),
-        'expectancy_r': round(kelly, 3),
-        'buy_sell': dict(Counter(t['signal_type'] for t in trades)),
-    }
+    return {'n_trades': n, 'win_rate_pct': round(wr * 100, 1),
+            'avg_rr_realized': round(avg_rr, 2), 'expectancy_r': round(kelly, 3)}
 
 
 if __name__ == '__main__':
@@ -296,14 +272,15 @@ if __name__ == '__main__':
     pd_arrays = load_pd_arrays(conn, START)
     print(f"M5={len(m5)} H1={len(h1)} H4={len(h4)} PD_arrays={len(pd_arrays)}\n")
 
-    thresholds = [0.0, 1.5, 3.0, 5.0, 8.0]
+    print("=== BASELINE (comportement actuel, BUY autorise en premium) ===")
+    trades_base, _ = run_backtest(m5, h1, h4, pd_arrays, require_not_premium=False)
+    for k, v in compute_metrics(trades_base).items():
+        print(f"  {k}: {v}")
 
-    for atr_min in thresholds:
-        print(f"=== ATR_MIN_PIPS = {atr_min} ===")
-        trades = run_backtest_for_atr(m5, h1, h4, pd_arrays, atr_min)
-        metrics = compute_metrics(trades)
-        for k, v in metrics.items():
-            print(f"  {k}: {v}")
-        print()
+    print("\n=== REGLE SYMETRIQUE : BUY interdit en zone PREMIUM ===")
+    trades_rule, n_blocked = run_backtest(m5, h1, h4, pd_arrays, require_not_premium=True)
+    for k, v in compute_metrics(trades_rule).items():
+        print(f"  {k}: {v}")
+    print(f"  Setups bloques par la regle (auraient ete pris sinon): {n_blocked}")
 
     conn.close()
