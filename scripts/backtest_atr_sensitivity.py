@@ -275,12 +275,12 @@ def compute_metrics(trades):
     wins = [t for t in trades if t['result'] == 'WIN']
     wr = len(wins) / n
     avg_rr = sum(t['rr_real'] for t in wins) / len(wins) if wins else 0
-    kelly = wr * avg_rr - (1 - wr)
+    expectancy_r = wr * avg_rr - (1 - wr)
     return {
         'n_trades': n,
         'win_rate_pct': round(wr * 100, 1),
         'avg_rr_realized': round(avg_rr, 2),
-        'expectancy_r': round(kelly, 3),
+        'expectancy_r': round(expectancy_r, 3),
         'buy_sell': dict(Counter(t['signal_type'] for t in trades)),
     }
 

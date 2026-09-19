@@ -303,8 +303,8 @@ if __name__ == '__main__':
         wins = [t for t in trades if t['result'] == 'WIN']
         wr = len(wins) / n
         avg_rr = sum(t['rr_real'] for t in wins) / len(wins) if wins else 0
-        kelly = wr * avg_rr - (1 - wr)
+        expectancy_r = wr * avg_rr - (1 - wr)
         print(f"WIN: {len(wins)} | LOSS: {n - len(wins)}")
-        print(f"WR: {round(wr*100,1)}% | RR moyen (gagnants): {round(avg_rr,2)} | Kelly: {round(kelly,3)}")
+        print(f"WR: {round(wr*100,1)}% | RR moyen (gagnants): {round(avg_rr,2)} | Kelly: {round(expectancy_r,3)}")
 
     conn.close()

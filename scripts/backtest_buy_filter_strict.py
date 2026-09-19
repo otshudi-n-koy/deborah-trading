@@ -484,13 +484,13 @@ def compute_metrics(results):
     wins = [r for r in results if r['result'] == 'WIN']
     wr = len(wins) / n
     avg_rr = sum(r['rr_realized'] for r in wins) / len(wins) if wins else 0
-    kelly = wr * avg_rr - (1 - wr)
+    expectancy_r = wr * avg_rr - (1 - wr)
     from collections import Counter
     return {
         'n_trades': n,
         'win_rate_pct': round(wr * 100, 2),
         'avg_rr_realized': round(avg_rr, 2),
-        'expectancy_r': round(kelly, 3),
+        'expectancy_r': round(expectancy_r, 3),
         'exit_reason_distribution': dict(Counter(r['exit_reason'] for r in results)),
         'zone_type_distribution': dict(Counter(r['zone_type'] for r in results)),
     }
