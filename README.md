@@ -122,6 +122,8 @@ Discipline de patch (universelle) :
 | 09/09 | Règle SELL≠DISCOUNT validée le 25/08 jamais déployée en réel | Déployée |
 | 09-10/09 | Règle symétrique BUY≠PREMIUM découverte et déployée | Déployé |
 | 10/09 | Conflit logique invalidation de zone / remplissage d'ordre LIMIT | Corrigé (ticket #73) |
+| 18-19/09 | Metrique 'Kelly' des scripts de backtest = espérance en R, pas la vraie fraction de Kelly (risk_manager.py, lui, utilise la bonne formule) | Renomme expectancy_r (2 commits, le premier incomplet) |
+| 19/09 | Backtests avec seuils differents non emboites (politique "une position a la fois") - un trade a seuil bas pris tot evince un trade a seuil haut qui aurait suivi. Toute comparaison de parametres graduels par simple comptage (n, WR, expectancy) est biaisee | Identifie, methode d'eviction explicite a construire (ticket #80) |
 
 ---
 
